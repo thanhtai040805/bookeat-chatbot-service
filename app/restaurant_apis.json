@@ -1,0 +1,321 @@
+{
+  "project_info": {
+    "name": "AI Chatbot API Endpoints",
+    "description": "API endpoints cho AI Chatbot integration với Spring Boot",
+    "base_urls": {
+      "development": "http://localhost:8080",
+      "production": "https://bookeat-service.onrender.com"
+    },
+    "ai_restaurant_id": 37,
+    "ai_username": "AI Assistant"
+  },
+
+  "ai_chat_flow": {
+    "description": "Luồng xử lý AI chat hoàn chỉnh",
+    "steps": [
+      "1. Customer gửi message qua WebSocket",
+      "2. Spring Boot lưu user message và gọi AI service",
+      "3. AI service nhận request và xử lý logic",
+      "4. AI service gọi các APIs để lấy dữ liệu",
+      "5. AI service tạo response và gửi về Spring Boot",
+      "6. Spring Boot lưu AI response và broadcast qua WebSocket"
+    ]
+  },
+
+  "ai_service_apis": {
+    "receive_user_message": {
+      "method": "POST",
+      "endpoint": "http://localhost:8000/chat (DEV) hoặc https://restaurant-chatbot-service.onrender.com/chat (PROD)",
+      "description": "API được Spring Boot gọi để gửi user message cho AI",
+      "authentication": false,
+      "body": {
+        "message": "string - tin nhắn từ customer",
+        "userId": "string - UUID của customer",
+        "timestamp": "long - timestamp hiện tại"
+      },
+      "response": {
+        "response": "string - AI response"
+      }
+    }
+  },
+
+  "restaurant_apis_for_ai": {
+    "get_all_restaurants": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants",
+      "description": "Lấy danh sách tất cả nhà hàng",
+      "authentication": false,
+      "response": "array of RestaurantDto",
+      "use_case": "AI có thể sử dụng để tìm nhà hàng phù hợp với yêu cầu của customer"
+    },
+    
+    "get_restaurant_details": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/{restaurantId}",
+      "description": "Chi tiết nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "RestaurantDto object",
+      "use_case": "AI lấy thông tin chi tiết nhà hàng để tư vấn"
+    },
+    
+    "get_restaurant_menu": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/{restaurantId}/dishes",
+      "description": "Menu nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "array of DishDto",
+      "use_case": "AI có thể tư vấn món ăn phù hợp"
+    },
+    
+    "get_restaurant_services": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/{restaurantId}/services",
+      "description": "Dịch vụ nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "array of RestaurantServiceDto",
+      "use_case": "AI tư vấn các dịch vụ có sẵn"
+    },
+    
+    "get_restaurant_tables": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/{restaurantId}/tables",
+      "description": "Danh sách bàn nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "array of RestaurantTableDto",
+      "use_case": "AI kiểm tra loại bàn phù hợp với số lượng khách"
+    },
+    
+    "check_availability": {
+      "method": "GET",
+      "endpoint": "/api/booking/availability-check",
+      "description": "Kiểm tra bàn trống",
+      "authentication": false,
+      "params": ["restaurantId", "bookingTime", "guestCount", "selectedTableIds(optional)"],
+      "response": "AvailabilityCheckResponse object",
+      "use_case": "AI kiểm tra bàn trống và đưa ra gợi ý thời gian đặt bàn"
+    },
+    
+    "get_restaurant_reviews": {
+      "method": "GET",
+      "endpoint": "/api/restaurants/{restaurantId}/reviews",
+      "description": "Đánh giá nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "array of ReviewDto",
+      "use_case": "AI có thể tham khảo đánh giá để tư vấn"
+    },
+    
+    "get_restaurant_by_cuisine": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/search",
+      "description": "Tìm nhà hàng theo loại ẩm thực",
+      "authentication": false,
+      "params": ["cuisineType", "location(optional)"],
+      "response": "array of RestaurantDto",
+      "use_case": "AI tìm nhà hàng phù hợp với sở thích ẩm thực"
+    }
+  },
+
+  "booking_apis_for_ai": {
+    "get_booking_details": {
+      "method": "GET",
+      "endpoint": "/api/booking/{bookingId}/details",
+      "description": "Chi tiết booking",
+      "authentication": true,
+      "params": ["bookingId"],
+      "response": "BookingDetailsDto object",
+      "use_case": "AI có thể tra cứu thông tin booking của customer"
+    },
+    
+    "get_user_bookings": {
+      "method": "GET",
+      "endpoint": "/api/booking/user/{userId}/history",
+      "description": "Lịch sử đặt bàn của user",
+      "authentication": true,
+      "params": ["userId"],
+      "response": "array of BookingDto",
+      "use_case": "AI có thể tham khảo lịch sử để đưa ra gợi ý cá nhân hóa"
+    },
+    
+    "check_booking_status": {
+      "method": "GET",
+      "endpoint": "/api/booking/{bookingId}/status",
+      "description": "Kiểm tra trạng thái booking",
+      "authentication": true,
+      "params": ["bookingId"],
+      "response": "BookingStatusDto",
+      "use_case": "AI có thể kiểm tra và thông báo trạng thái booking"
+    }
+  },
+
+  "voucher_apis_for_ai": {
+    "validate_voucher": {
+      "method": "POST",
+      "endpoint": "/api/vouchers/validate",
+      "description": "Kiểm tra voucher",
+      "authentication": false,
+      "body": {
+        "code": "string",
+        "restaurantId": "integer",
+        "bookingTime": "datetime",
+        "guestCount": "integer",
+        "orderAmount": "decimal"
+      },
+      "response": "ValidationResponse object",
+      "use_case": "AI có thể kiểm tra và tư vấn voucher phù hợp"
+    },
+    
+    "get_available_vouchers": {
+      "method": "GET",
+      "endpoint": "/api/vouchers/available",
+      "description": "Lấy danh sách voucher khả dụng",
+      "authentication": false,
+      "params": ["restaurantId(optional)", "userId(optional)"],
+      "response": "array of VoucherDto",
+      "use_case": "AI có thể đề xuất voucher cho customer"
+    }
+  },
+
+  "payment_apis_for_ai": {
+    "get_payment_methods": {
+      "method": "GET",
+      "endpoint": "/api/payment/methods",
+      "description": "Lấy danh sách phương thức thanh toán",
+      "authentication": false,
+      "response": "array of PaymentMethodDto",
+      "use_case": "AI có thể tư vấn phương thức thanh toán"
+    },
+    
+    "get_payment_status": {
+      "method": "GET",
+      "endpoint": "/api/payment/{paymentId}/status",
+      "description": "Kiểm tra trạng thái thanh toán",
+      "authentication": true,
+      "params": ["paymentId"],
+      "response": "PaymentStatusDto",
+      "use_case": "AI có thể kiểm tra trạng thái thanh toán"
+    }
+  },
+
+  "user_apis_for_ai": {
+    "get_user_profile": {
+      "method": "GET",
+      "endpoint": "/api/user/profile",
+      "description": "Lấy thông tin profile user",
+      "authentication": true,
+      "response": "UserProfileDto",
+      "use_case": "AI có thể cá nhân hóa trải nghiệm dựa trên thông tin user"
+    },
+    
+    "get_user_preferences": {
+      "method": "GET",
+      "endpoint": "/api/user/preferences",
+      "description": "Lấy sở thích của user",
+      "authentication": true,
+      "response": "UserPreferencesDto",
+      "use_case": "AI có thể đưa ra gợi ý phù hợp với sở thích"
+    }
+  },
+
+  "location_apis_for_ai": {
+    "get_restaurants_by_location": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/nearby",
+      "description": "Tìm nhà hàng gần vị trí",
+      "authentication": false,
+      "params": ["latitude", "longitude", "radius(optional)"],
+      "response": "array of RestaurantDto",
+      "use_case": "AI có thể tìm nhà hàng gần vị trí customer"
+    },
+    
+    "get_popular_locations": {
+      "method": "GET",
+      "endpoint": "/api/locations/popular",
+      "description": "Lấy danh sách địa điểm phổ biến",
+      "authentication": false,
+      "response": "array of LocationDto",
+      "use_case": "AI có thể đề xuất địa điểm phổ biến"
+    }
+  },
+
+  "websocket_endpoints": {
+    "chat_websocket": {
+      "endpoint": "/ws",
+      "description": "WebSocket endpoint cho real-time chat",
+      "subscription": "/topic/room/{roomId}",
+      "send_message": "/app/chat.sendMessage",
+      "typing_indicator": "/app/chat.typing"
+    },
+    "ai_chat_specific": {
+      "description": "AI chat sử dụng cùng WebSocket endpoint",
+      "ai_restaurant_detection": "ChatMessageController tự động phát hiện room thuộc AI restaurant (ID = 37)",
+      "ai_response_flow": "AI response được gửi qua /topic/room/{roomId}"
+    }
+  },
+
+  "ai_agent_implementation_guide": {
+    "message_processing": {
+      "intent_recognition": [
+        "Tìm nhà hàng theo địa điểm",
+        "Tìm nhà hàng theo loại ẩm thực", 
+        "Đặt bàn",
+        "Kiểm tra bàn trống",
+        "Tư vấn menu",
+        "Kiểm tra voucher",
+        "Hỏi về dịch vụ nhà hàng",
+        "Tra cứu booking",
+        "Hỗ trợ thanh toán"
+      ],
+      "response_generation": [
+        "Tạo response dựa trên dữ liệu từ APIs",
+        "Đưa ra gợi ý cá nhân hóa",
+        "Xử lý trường hợp không tìm thấy thông tin",
+        "Hướng dẫn customer các bước tiếp theo"
+      ]
+    },
+    
+    "api_usage_patterns": {
+      "restaurant_search": "get_restaurants_by_location -> get_restaurant_details -> check_availability",
+      "menu_consultation": "get_restaurant_details -> get_restaurant_menu -> get_restaurant_reviews",
+      "booking_assistance": "check_availability -> validate_voucher -> get_payment_methods",
+      "personalized_recommendations": "get_user_profile -> get_user_preferences -> get_user_bookings"
+    }
+  },
+
+  "configuration": {
+    "ai_server_urls": {
+      "development": "http://localhost:8000",
+      "production": "https://restaurant-chatbot-service.onrender.com"
+    },
+    "timeouts": {
+      "development": "30000ms (30 seconds)",
+      "production": "60000ms (60 seconds)"
+    }
+  },
+
+  "error_handling": {
+    "ai_server_unavailable": "Trả về message: 'Xin lỗi, AI server hiện đang không khả dụng. Vui lòng thử lại sau.'",
+    "api_timeout": "Trả về message: 'Xin lỗi, hệ thống đang xử lý. Vui lòng thử lại sau.'",
+    "no_data_found": "Trả về message: 'Xin lỗi, không tìm thấy thông tin phù hợp. Bạn có thể thử tìm kiếm với tiêu chí khác.'",
+    "general_error": "Trả về message: 'Xin lỗi, có lỗi xảy ra khi xử lý tin nhắn của bạn.'"
+  },
+
+  "best_practices": {
+    "api_calling": [
+      "Luôn kiểm tra status code trước khi xử lý response",
+      "Sử dụng timeout phù hợp cho mỗi API call",
+      "Cache dữ liệu tĩnh (menu, dịch vụ) để tăng performance",
+      "Xử lý lỗi gracefully và đưa ra thông báo thân thiện"
+    ],
+    "response_generation": [
+      "Tạo response ngắn gọn, dễ hiểu",
+      "Đưa ra gợi ý cụ thể thay vì thông tin chung chung",
+      "Sử dụng emoji và format để tăng tính thân thiện",
+      "Luôn kết thúc bằng câu hỏi để khuyến khích tương tác"
+    ]
+  }
+}

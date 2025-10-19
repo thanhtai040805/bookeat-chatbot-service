@@ -1,0 +1,18 @@
+# Environment
+.env*
+*.env
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build / dist
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# IDE settings
+.vscode/
+.idea/
