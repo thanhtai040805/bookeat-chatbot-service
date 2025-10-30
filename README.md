@@ -27,7 +27,7 @@ ai-services/
    ```
 3. Run the API:
    ```bash
-   uvicorn app.RestaurantChatbot:app --host 0.0.0.0 --port 8000 --reload
+   uvicorn app.main:app --reload
    ```
 4. Send a sample request:
    ```bash

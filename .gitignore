@@ -16,3 +16,10 @@ dist/
 # IDE settings
 .vscode/
 .idea/
+
+# Ignore Qdrant data folder
+qdrant/
+qdrant_data/
+data/qdrant/
+*.snapshot
+*.wal

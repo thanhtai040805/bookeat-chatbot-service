@@ -2,7 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import load_environment
-from app.routers import chat, health
+from app.routers import chat, health, sync, vector
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,  # bật toàn bộ log debug
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 
 # Load configuration once so environment-specific settings are ready.
 _settings = load_environment()
@@ -25,6 +31,8 @@ app.add_middleware(
 # Register routers.
 app.include_router(chat.router)
 app.include_router(health.router)
+app.include_router(sync.router)
+app.include_router(vector.router)
 
 
 @app.get("/")

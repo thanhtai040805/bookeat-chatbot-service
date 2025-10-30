@@ -89,6 +89,16 @@
       "use_case": "AI kiểm tra loại bàn phù hợp với số lượng khách"
     },
     
+    "get_table_layouts": {
+      "method": "GET",
+      "endpoint": "/api/booking/restaurants/{restaurantId}/table-layouts",
+      "description": "Lấy table layouts của nhà hàng",
+      "authentication": false,
+      "params": ["restaurantId"],
+      "response": "array of Map<String, Object>",
+      "use_case": "AI có thể hiển thị sơ đồ bàn của nhà hàng"
+    },
+    
     "check_availability": {
       "method": "GET",
       "endpoint": "/api/booking/availability-check",
@@ -97,26 +107,6 @@
       "params": ["restaurantId", "bookingTime", "guestCount", "selectedTableIds(optional)"],
       "response": "AvailabilityCheckResponse object",
       "use_case": "AI kiểm tra bàn trống và đưa ra gợi ý thời gian đặt bàn"
-    },
-    
-    "get_restaurant_reviews": {
-      "method": "GET",
-      "endpoint": "/api/restaurants/{restaurantId}/reviews",
-      "description": "Đánh giá nhà hàng",
-      "authentication": false,
-      "params": ["restaurantId"],
-      "response": "array of ReviewDto",
-      "use_case": "AI có thể tham khảo đánh giá để tư vấn"
-    },
-    
-    "get_restaurant_by_cuisine": {
-      "method": "GET",
-      "endpoint": "/api/booking/restaurants/search",
-      "description": "Tìm nhà hàng theo loại ẩm thực",
-      "authentication": false,
-      "params": ["cuisineType", "location(optional)"],
-      "response": "array of RestaurantDto",
-      "use_case": "AI tìm nhà hàng phù hợp với sở thích ẩm thực"
     }
   },
 
@@ -131,24 +121,47 @@
       "use_case": "AI có thể tra cứu thông tin booking của customer"
     },
     
-    "get_user_bookings": {
+    "get_available_time_slots": {
       "method": "GET",
-      "endpoint": "/api/booking/user/{userId}/history",
-      "description": "Lịch sử đặt bàn của user",
-      "authentication": true,
-      "params": ["userId"],
-      "response": "array of BookingDto",
-      "use_case": "AI có thể tham khảo lịch sử để đưa ra gợi ý cá nhân hóa"
+      "endpoint": "/api/booking/conflicts/available-slots/{tableId}",
+      "description": "Lấy danh sách time slots khả dụng cho một bàn",
+      "authentication": false,
+      "params": ["tableId", "date"],
+      "response": "AvailableSlotsResponse",
+      "use_case": "AI có thể đưa ra gợi ý thời gian đặt bàn cụ thể"
     },
     
-    "check_booking_status": {
-      "method": "GET",
-      "endpoint": "/api/booking/{bookingId}/status",
-      "description": "Kiểm tra trạng thái booking",
+    "check_booking_conflicts": {
+      "method": "POST",
+      "endpoint": "/api/booking/conflicts/check",
+      "description": "Kiểm tra conflicts cho booking mới",
+      "authentication": false,
+      "body": {
+        "bookingForm": "BookingForm object",
+        "customerId": "UUID"
+      },
+      "response": "ConflictCheckResponse",
+      "use_case": "AI có thể kiểm tra xem booking có conflict không"
+    },
+    
+    "join_waitlist": {
+      "method": "POST",
+      "endpoint": "/api/booking/join-waitlist",
+      "description": "Tham gia waitlist",
       "authentication": true,
-      "params": ["bookingId"],
-      "response": "BookingStatusDto",
-      "use_case": "AI có thể kiểm tra và thông báo trạng thái booking"
+      "body": "JoinWaitlistRequest",
+      "response": "JoinWaitlistResponse",
+      "use_case": "AI có thể giúp customer tham gia waitlist khi không có bàn trống"
+    },
+    
+    "get_waitlist_details": {
+      "method": "GET",
+      "endpoint": "/api/booking/waitlist/{waitlistId}/details",
+      "description": "Lấy chi tiết waitlist",
+      "authentication": true,
+      "params": ["waitlistId"],
+      "response": "WaitlistDetailsResponse",
+      "use_case": "AI có thể kiểm tra trạng thái waitlist của customer"
     }
   },
 
@@ -169,76 +182,122 @@
       "use_case": "AI có thể kiểm tra và tư vấn voucher phù hợp"
     },
     
-    "get_available_vouchers": {
+    "get_demo_vouchers": {
       "method": "GET",
-      "endpoint": "/api/vouchers/available",
-      "description": "Lấy danh sách voucher khả dụng",
+      "endpoint": "/api/vouchers/demo",
+      "description": "Lấy demo vouchers",
       "authentication": false,
-      "params": ["restaurantId(optional)", "userId(optional)"],
-      "response": "array of VoucherDto",
+      "params": ["restaurantId(optional)"],
+      "response": "array of VoucherSummary",
       "use_case": "AI có thể đề xuất voucher cho customer"
-    }
-  },
-
-  "payment_apis_for_ai": {
-    "get_payment_methods": {
-      "method": "GET",
-      "endpoint": "/api/payment/methods",
-      "description": "Lấy danh sách phương thức thanh toán",
-      "authentication": false,
-      "response": "array of PaymentMethodDto",
-      "use_case": "AI có thể tư vấn phương thức thanh toán"
     },
     
-    "get_payment_status": {
+    "get_my_vouchers": {
       "method": "GET",
-      "endpoint": "/api/payment/{paymentId}/status",
-      "description": "Kiểm tra trạng thái thanh toán",
+      "endpoint": "/api/vouchers/my",
+      "description": "Lấy vouchers của customer",
       "authentication": true,
-      "params": ["paymentId"],
-      "response": "PaymentStatusDto",
-      "use_case": "AI có thể kiểm tra trạng thái thanh toán"
+      "response": "array of VoucherSummary",
+      "use_case": "AI có thể xem vouchers đã được assign cho customer"
+    },
+    
+    "assign_voucher": {
+      "method": "POST",
+      "endpoint": "/api/vouchers/assign/{voucherId}",
+      "description": "Assign voucher cho customer",
+      "authentication": true,
+      "params": ["voucherId"],
+      "response": "Success message",
+      "use_case": "AI có thể assign voucher cho customer"
     }
   },
 
   "user_apis_for_ai": {
-    "get_user_profile": {
+    "get_current_user": {
       "method": "GET",
-      "endpoint": "/api/user/profile",
-      "description": "Lấy thông tin profile user",
+      "endpoint": "/api/user/current",
+      "description": "Lấy thông tin user hiện tại",
       "authentication": true,
-      "response": "UserProfileDto",
-      "use_case": "AI có thể cá nhân hóa trải nghiệm dựa trên thông tin user"
-    },
-    
-    "get_user_preferences": {
-      "method": "GET",
-      "endpoint": "/api/user/preferences",
-      "description": "Lấy sở thích của user",
-      "authentication": true,
-      "response": "UserPreferencesDto",
-      "use_case": "AI có thể đưa ra gợi ý phù hợp với sở thích"
+      "response": "UserInfoResponse",
+      "use_case": "AI có thể lấy thông tin user để cá nhân hóa"
     }
   },
 
-  "location_apis_for_ai": {
-    "get_restaurants_by_location": {
+  "chat_apis_for_ai": {
+    "get_available_restaurants": {
       "method": "GET",
-      "endpoint": "/api/booking/restaurants/nearby",
-      "description": "Tìm nhà hàng gần vị trí",
-      "authentication": false,
-      "params": ["latitude", "longitude", "radius(optional)"],
-      "response": "array of RestaurantDto",
-      "use_case": "AI có thể tìm nhà hàng gần vị trí customer"
+      "endpoint": "/api/chat/available-restaurants",
+      "description": "Lấy danh sách nhà hàng có thể chat",
+      "authentication": true,
+      "response": "array of RestaurantProfile",
+      "use_case": "AI có thể xem danh sách nhà hàng có thể chat"
     },
     
-    "get_popular_locations": {
+    "get_available_admins": {
       "method": "GET",
-      "endpoint": "/api/locations/popular",
-      "description": "Lấy danh sách địa điểm phổ biến",
-      "authentication": false,
-      "response": "array of LocationDto",
-      "use_case": "AI có thể đề xuất địa điểm phổ biến"
+      "endpoint": "/api/chat/available-admins",
+      "description": "Lấy danh sách admin có thể chat",
+      "authentication": true,
+      "response": "array of User",
+      "use_case": "AI có thể xem danh sách admin có thể chat"
+    },
+    
+    "get_chat_rooms": {
+      "method": "GET",
+      "endpoint": "/api/chat/rooms",
+      "description": "Lấy chat rooms của user",
+      "authentication": true,
+      "response": "array of ChatRoomInfo",
+      "use_case": "AI có thể xem lịch sử chat của customer"
+    },
+    
+    "create_chat_room": {
+      "method": "POST",
+      "endpoint": "/api/chat/rooms",
+      "description": "Tạo chat room với restaurant",
+      "authentication": true,
+      "params": ["restaurantId"],
+      "response": "ChatRoomInfo",
+      "use_case": "AI có thể tạo chat room mới"
+    },
+    
+    "get_messages": {
+      "method": "GET",
+      "endpoint": "/api/chat/rooms/{roomId}/messages",
+      "description": "Lấy messages trong room",
+      "authentication": true,
+      "params": ["roomId", "page", "size"],
+      "response": "array of Message",
+      "use_case": "AI có thể xem lịch sử tin nhắn"
+    },
+    
+    "mark_messages_read": {
+      "method": "POST",
+      "endpoint": "/api/chat/rooms/{roomId}/read",
+      "description": "Đánh dấu messages đã đọc",
+      "authentication": true,
+      "params": ["roomId"],
+      "response": "Success message",
+      "use_case": "AI có thể đánh dấu tin nhắn đã đọc"
+    },
+    
+    "get_unread_count": {
+      "method": "GET",
+      "endpoint": "/api/chat/unread-count",
+      "description": "Lấy unread count tổng",
+      "authentication": true,
+      "response": "UnreadCountResponse",
+      "use_case": "AI có thể kiểm tra số tin nhắn chưa đọc"
+    },
+    
+    "archive_chat_room": {
+      "method": "POST",
+      "endpoint": "/api/chat/rooms/{roomId}/archive",
+      "description": "Archive chat room",
+      "authentication": true,
+      "params": ["roomId"],
+      "response": "Success message",
+      "use_case": "AI có thể archive chat room"
     }
   },
 
@@ -268,7 +327,7 @@
         "Kiểm tra voucher",
         "Hỏi về dịch vụ nhà hàng",
         "Tra cứu booking",
-        "Hỗ trợ thanh toán"
+        "Tham gia waitlist"
       ],
       "response_generation": [
         "Tạo response dựa trên dữ liệu từ APIs",
@@ -279,10 +338,10 @@
     },
     
     "api_usage_patterns": {
-      "restaurant_search": "get_restaurants_by_location -> get_restaurant_details -> check_availability",
-      "menu_consultation": "get_restaurant_details -> get_restaurant_menu -> get_restaurant_reviews",
-      "booking_assistance": "check_availability -> validate_voucher -> get_payment_methods",
-      "personalized_recommendations": "get_user_profile -> get_user_preferences -> get_user_bookings"
+      "restaurant_search": "get_all_restaurants -> get_restaurant_details -> check_availability",
+      "menu_consultation": "get_restaurant_details -> get_restaurant_menu -> get_restaurant_services",
+      "booking_assistance": "check_availability -> check_booking_conflicts -> join_waitlist",
+      "voucher_assistance": "get_demo_vouchers -> validate_voucher -> assign_voucher"
     }
   },
 
