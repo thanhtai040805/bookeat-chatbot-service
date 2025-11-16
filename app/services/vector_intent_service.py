@@ -442,34 +442,71 @@ Lưu ý:
         """
         Combine results với priority: Intent Collection > LLM > Vector > Pattern
         
-        LLM được ưu tiên cao hơn Pattern vì hiểu context conversation tốt hơn
+        ✅ CẢI THIỆN: Ưu tiên pattern nếu LLM trả general_inquiry (tránh học sai)
+        
+        Strategy:
+        1. Intent Collection (confidence >= 0.8) → ưu tiên cao nhất
+        2. LLM classification (confidence >= 0.5) → NHƯNG nếu LLM trả general_inquiry mà pattern có giá trị → ưu tiên pattern
+        3. Pattern matching (nếu LLM confidence < 0.7 và pattern có giá trị) → ưu tiên pattern
+        4. Vector search
+        5. Fallback theo priority
         """
         # Priority 1: Intent Collection (nếu confidence >= 0.8)
         if intent_collection_result.get("confidence", 0) >= 0.8:
             logger.info(f"Using Intent Collection: {intent_collection_result['intent']} (confidence: {intent_collection_result['confidence']})")
             return intent_collection_result
         
+        llm_intent_name = llm_intent.get("intent", "general_inquiry")
+        llm_conf = llm_intent.get("confidence", 0)
+        pattern_intent_name = pattern_intent.get("intent", "general_inquiry")
+        pattern_conf = pattern_intent.get("confidence", 0)
+        
+        # ✅ FIX: Nếu LLM trả general_inquiry mà pattern đã match một intent cụ thể → ưu tiên pattern
+        if (llm_intent_name == "general_inquiry" and 
+            pattern_intent_name != "general_inquiry" and 
+            pattern_conf >= 0.5):
+            logger.info(
+                f"LLM returned general_inquiry (conf={llm_conf}), but pattern matched {pattern_intent_name} "
+                f"(conf={pattern_conf}) → Using pattern"
+            )
+            # Tăng confidence của pattern để tránh bị override
+            pattern_intent["confidence"] = max(pattern_conf, 0.7)
+            pattern_intent["method"] = "pattern_override_llm_general"
+            return pattern_intent
+        
+        # ✅ FIX: Nếu LLM confidence < 0.7 mà pattern có giá trị → ưu tiên pattern
+        if (llm_conf < 0.7 and 
+            pattern_intent_name != "general_inquiry" and 
+            pattern_conf >= 0.5):
+            logger.info(
+                f"LLM confidence ({llm_conf}) < 0.7, but pattern matched {pattern_intent_name} "
+                f"(conf={pattern_conf}) → Using pattern"
+            )
+            pattern_intent["confidence"] = max(pattern_conf, 0.7)
+            pattern_intent["method"] = "pattern_override_llm_low_confidence"
+            return pattern_intent
+        
         # Priority 2: LLM classification (ưu tiên cao vì hiểu context - giảm threshold xuống 0.5)
-        if llm_intent.get("confidence", 0) >= 0.5:
-            logger.info(f"Using LLM classification: {llm_intent['intent']} (confidence: {llm_intent['confidence']})")
+        if llm_conf >= 0.5:
+            logger.info(f"Using LLM classification: {llm_intent_name} (confidence: {llm_conf})")
             return llm_intent
         
-        # Priority 3: Vector search (nếu confidence >= 0.6)
+        # Priority 3: Pattern matching (nếu có giá trị và LLM confidence thấp)
+        if pattern_conf >= 0.5:
+            logger.info(f"Using Pattern matching: {pattern_intent_name} (confidence: {pattern_conf})")
+            return pattern_intent
+        
+        # Priority 4: Vector search (nếu confidence >= 0.6)
         if vector_intent.get("confidence", 0) >= 0.6:
             logger.info(f"Using Vector search: {vector_intent['intent']} (confidence: {vector_intent['confidence']})")
             return vector_intent
-        
-        # Priority 4: Pattern matching (chỉ khi LLM và Vector đều thấp)
-        if pattern_intent.get("confidence", 0) >= 0.5 and llm_intent.get("confidence", 0) < 0.5:
-            logger.info(f"Using Pattern matching: {pattern_intent['intent']} (confidence: {pattern_intent['confidence']})")
-            return pattern_intent
         
         # Priority 5: Intent Collection (nếu có, dù confidence thấp)
         if intent_collection_result.get("confidence", 0) > 0:
             return intent_collection_result
         
         # Priority 6: LLM (nếu có, dù confidence thấp)
-        if llm_intent.get("confidence", 0) > 0:
+        if llm_conf > 0:
             return llm_intent
         
         # Priority 7: Vector (nếu có, dù confidence thấp)
@@ -1087,6 +1124,7 @@ Lưu ý:
             )
             
             # 2. Store successful patterns for future recognition
+            # ✅ FIX: Chỉ store pattern nếu intent không phải general_inquiry (tránh học sai)
             if response_success and intent != "general_inquiry":
                 pattern_data = {
                     'pattern': user_message,
@@ -1102,8 +1140,10 @@ Lưu ý:
                 )
             
             # 3. FEEDBACK LEARNING LOOP - Store feedback để retrain sau
-            if not response_success or intent == "general_inquiry":
-                # Low confidence hoặc failed → Store để học
+            # ✅ FIX: Không store feedback cho general_inquiry khi response_success=True (tránh học sai)
+            # Chỉ store feedback cho failed cases hoặc general_inquiry + failed
+            if not response_success or (intent == "general_inquiry" and not response_success):
+                # Failed → Store để học
                 feedback_entry = {
                     'user_message': user_message,
                     'predicted_intent': intent,

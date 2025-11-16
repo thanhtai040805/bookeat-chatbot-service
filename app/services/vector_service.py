@@ -891,6 +891,199 @@ class VectorService:
             logger.error(f"Error searching menus: {e}")
             return []
 
+    async def semantic_menu_search_with_reasoning(
+        self,
+        user_message: str,
+        reasoning_profile: Dict[str, Any],
+        restaurant_id: int = None,
+        limit: int = 10,
+        distance_threshold: float = 0.6
+    ) -> List[Dict]:
+        """
+        Semantic search kết hợp reasoning profile
+        
+        Strategy:
+        1. Tạo embedding từ user_message + reasoning summary (enhanced query)
+        2. Vector search để lấy candidates
+        3. Filter & boost theo tags/metadata match với reasoning profile
+        
+        Args:
+            user_message: User query về món ăn
+            reasoning_profile: Profile từ LLM reasoning (diet_profile, occasion, temperature, ...)
+            restaurant_id: Filter theo restaurant (optional)
+            limit: Số lượng results
+            distance_threshold: Distance threshold cho vector search
+            
+        Returns:
+            List of menu results với distance/score đã được boost
+        """
+        try:
+            # 1. Tạo enhanced query text với search_query + summary (HYBRID APPROACH)
+            # Priority: search_query (LLM-generated) > summary > user_message
+            search_query = reasoning_profile.get("search_query", "").strip()
+            summary = reasoning_profile.get("summary", "").strip()
+            
+            if search_query:
+                # Nếu có search_query từ LLM → dùng search_query (đã được tối ưu)
+                query_text = search_query
+                if summary and summary != search_query:
+                    # Thêm summary nếu khác với search_query (thêm context)
+                    query_text += f". {summary}"
+            elif summary:
+                # Fallback: dùng summary nếu không có search_query
+                query_text = summary
+            else:
+                # Fallback cuối: dùng user_message
+                query_text = user_message
+            
+            logger.debug(f"Semantic search query: {query_text[:100]}...")
+            
+            # 2. Vector search với enhanced query (lấy nhiều hơn để filter)
+            results = await self.search_menus(
+                query_text,
+                restaurant_id=restaurant_id,
+                limit=limit * 3,  # Lấy nhiều hơn để filter & boost
+                distance_threshold=distance_threshold * 1.2  # Threshold cao hơn để có đủ candidates
+            )
+            
+            if not results:
+                return []
+            
+            # 3. Convert distance to score và boost theo reasoning profile
+            filtered_results = []
+            diet_profile = reasoning_profile.get("diet_profile", {})
+            occasion = reasoning_profile.get("occasion", "any")
+            temperature = reasoning_profile.get("temperature", "any")
+            spice_level = reasoning_profile.get("spice_level", "any")
+            constraints = reasoning_profile.get("constraints", [])
+            
+            for result in results:
+                metadata = result.get("metadata", {})
+                
+                # Get tags (ensure it's a list)
+                tags = metadata.get("tags", [])
+                if isinstance(tags, str):
+                    try:
+                        import ast
+                        tags = ast.literal_eval(tags) if tags.startswith("[") else [tags]
+                    except:
+                        tags = [tags] if tags else []
+                if not isinstance(tags, list):
+                    tags = []
+                
+                # Start với base score (convert distance to similarity score)
+                base_distance = result.get("distance", 1.0)
+                base_score = max(0.0, 1.0 - base_distance)  # Convert distance to similarity (0..1)
+                
+                boost_score = 0.0  # Boost điểm cho matching tags
+                
+                # Boost theo diet_profile tags
+                if diet_profile.get("high_protein") and "high_protein" in tags:
+                    boost_score += 0.15
+                if diet_profile.get("low_carb") and "low_carb" in tags:
+                    boost_score += 0.12
+                if diet_profile.get("low_fat") and "low_fat" in tags:
+                    boost_score += 0.12
+                if diet_profile.get("light_meal") and "light_meal" in tags:
+                    boost_score += 0.10
+                
+                # Boost theo occasion
+                if occasion == "gym" and "high_protein" in tags:
+                    boost_score += 0.10
+                if occasion == "sick" and "good_when_sick" in tags:
+                    boost_score += 0.15
+                if occasion == "comfort" and "comfort_food" in tags:
+                    boost_score += 0.10
+                if occasion == "celebration" and "celebration" in tags:
+                    boost_score += 0.08
+                
+                # Boost theo temperature
+                if temperature == "hot":
+                    # Check nếu món nóng (từ category, name, description)
+                    category = (metadata.get("category") or "").lower()
+                    name = (metadata.get("name") or "").lower()
+                    desc = (metadata.get("description") or "").lower()
+                    hot_items = ["cháo", "soup", "canh", "lẩu", "phở", "bún", "miến", "nước dùng", "hot pot"]
+                    if any(item in category or item in name or item in desc for item in hot_items):
+                        boost_score += 0.12
+                
+                # Boost theo spice_level
+                if spice_level == "spicy" and (metadata.get("is_spicy") or "spicy" in tags):
+                    boost_score += 0.08
+                elif spice_level in ["mild", "medium"] and ("non_spicy" in tags or metadata.get("is_non_spicy")):
+                    boost_score += 0.06
+                
+                # Boost theo constraints_text (backward compatibility: cũng check "constraints")
+                constraints_text = reasoning_profile.get("constraints_text", constraints)
+                if not constraints_text:
+                    constraints_text = constraints  # Fallback
+                
+                constraint_text = f"{metadata.get('name', '')} {metadata.get('description', '')}".lower()
+                for constraint in constraints_text:
+                    constraint_lower = str(constraint).lower()
+                    if "chay" in constraint_lower and ("vegetarian" in tags or metadata.get("is_vegetarian")):
+                        boost_score += 0.10
+                    if "ít dầu" in constraint_lower or "ít béo" in constraint_lower:
+                        if "low_fat" in tags:
+                            boost_score += 0.08
+                    if "không cay" in constraint_lower:
+                        if "non_spicy" in tags or metadata.get("is_non_spicy"):
+                            boost_score += 0.08
+                
+                # Boost theo cuisine (nếu có)
+                cuisine_list = reasoning_profile.get("cuisine", [])
+                if isinstance(cuisine_list, list) and cuisine_list:
+                    # Check trong metadata (restaurant cuisine, dish category...)
+                    restaurant_cuisine = (metadata.get("restaurant_cuisine") or "").lower()
+                    dish_category = (metadata.get("category") or "").lower()
+                    for cuisine in cuisine_list:
+                        cuisine_lower = str(cuisine).lower()
+                        if cuisine_lower in restaurant_cuisine or cuisine_lower in dish_category:
+                            boost_score += 0.08
+                
+                # Boost theo is_local_specialty
+                if reasoning_profile.get("is_local_specialty") and metadata.get("is_local_specialty"):
+                    boost_score += 0.10
+                
+                # Final score = base_score + boost (cap at 1.0)
+                final_score = min(1.0, base_score + boost_score)
+                # Convert back to distance for consistency
+                final_distance = max(0.0, 1.0 - final_score)
+                
+                result["distance"] = final_distance
+                result["score"] = final_score  # Also store score for sorting
+                result["boost_score"] = boost_score  # Debug info
+                
+                filtered_results.append(result)
+            
+            # 4. Sort by score (descending) hoặc distance (ascending)
+            filtered_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            
+            # 5. Filter theo final distance threshold và limit
+            final_results = [
+                r for r in filtered_results
+                if r.get("distance", 1.0) < distance_threshold
+            ][:limit]
+            
+            logger.info(
+                "Semantic menu search with reasoning: found %s items (from %s candidates) for query: %s",
+                len(final_results),
+                len(results),
+                user_message[:50]
+            )
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"Error in semantic_menu_search_with_reasoning: {e}", exc_info=True)
+            # Fallback to regular search
+            return await self.search_menus(
+                user_message,
+                restaurant_id=restaurant_id,
+                limit=limit,
+                distance_threshold=distance_threshold
+            )
+
     async def store_user_preference(self, user_id: str, preference_type: str, data: Dict):
         """Store user preferences để cá nhân hóa."""
         try:
@@ -1177,19 +1370,131 @@ class VectorService:
             return json.dumps(table, ensure_ascii=False)
 
     def _create_menu_searchable_text(self, dish: Dict, restaurant_id: int) -> str:
-        """Tạo đoạn text có thể tìm kiếm từ dữ liệu món ăn."""
+        """
+        Tạo rich semantic text cho menu item với:
+        - Nutritional info, health attributes
+        - Dietary restrictions
+        - Tags từ LLM (nếu có)
+        - Contextual descriptions (nóng, lạnh, cay, chay...)
+        """
         try:
             text_parts = []
+            
+            # Basic info
             if dish.get("name"):
                 text_parts.append(f"Tên món: {dish['name']}")
             if dish.get("description"):
                 text_parts.append(f"Mô tả: {dish['description']}")
-            if dish.get("price"):
-                text_parts.append(f"Giá: {dish['price']}")
             if dish.get("category"):
                 text_parts.append(f"Loại: {dish['category']}")
-
-            text_parts.append(f"Nhà hàng: {restaurant_id}")
+            
+            # Restaurant context (semantic boost)
+            restaurant_name = dish.get("_restaurantName") or dish.get("restaurantName") or dish.get("restaurant_name")
+            if restaurant_name:
+                text_parts.append(f"Thuộc nhà hàng: {restaurant_name}")
+            
+            cuisine_type = dish.get("cuisineType") or dish.get("cuisine_type")
+            if cuisine_type:
+                text_parts.append(f"Ẩm thực: {cuisine_type}")
+            
+            # Tags-based semantic context (CHÍNH LÀ CÁI QUAN TRỌNG)
+            tags = dish.get("tags", [])
+            # Đảm bảo tags là list, không phải string
+            if isinstance(tags, str):
+                try:
+                    import ast
+                    tags = ast.literal_eval(tags) if tags.startswith("[") else [tags]
+                except:
+                    tags = [tags] if tags else []
+            
+            # ✅ Get ingredient_tags (MỚI - dùng cho dị ứng/kiêng khem)
+            ingredient_tags = dish.get("ingredient_tags", [])
+            if isinstance(ingredient_tags, str):
+                try:
+                    import ast
+                    ingredient_tags = ast.literal_eval(ingredient_tags) if ingredient_tags.startswith("[") else [ingredient_tags]
+                except:
+                    ingredient_tags = [ingredient_tags] if ingredient_tags else []
+            if not isinstance(ingredient_tags, list):
+                ingredient_tags = []
+            
+            if isinstance(tags, list) and tags:
+                tag_contexts = []
+                
+                # Health & nutritional tags
+                if "high_protein" in tags:
+                    tag_contexts.append("Giàu protein, phù hợp cho người tập gym, cần bổ sung đạm")
+                if "low_fat" in tags:
+                    tag_contexts.append("Ít dầu mỡ, ít béo, phù hợp ăn kiêng")
+                if "low_carb" in tags:
+                    tag_contexts.append("Ít tinh bột, low carb")
+                if "light_meal" in tags:
+                    tag_contexts.append("Món nhẹ, dễ tiêu, không quá no")
+                if "good_when_sick" in tags:
+                    tag_contexts.append("Phù hợp khi ốm, món nóng dễ tiêu, dễ nuốt")
+                
+                # Dietary restrictions
+                if "vegetarian" in tags or dish.get("is_vegetarian"):
+                    tag_contexts.append("Món chay, không có thịt")
+                if "vegan" in tags:
+                    tag_contexts.append("Món thuần chay, không sản phẩm động vật")
+                if dish.get("is_spicy") or "spicy" in tags:
+                    tag_contexts.append("Món cay, đậm đà")
+                if "non_spicy" in tags or dish.get("is_non_spicy"):
+                    tag_contexts.append("Món không cay, nhẹ nhàng")
+                
+                # Occasion tags
+                if "comfort_food" in tags:
+                    tag_contexts.append("Comfort food, món dễ chịu, thoải mái")
+                if "celebration" in tags:
+                    tag_contexts.append("Phù hợp cho dịp đặc biệt, tiệc tùng")
+                
+                if tag_contexts:
+                    text_parts.append("Đặc điểm: " + ", ".join(tag_contexts))
+            
+            # ✅ Ingredient context (MỚI - cho semantic search về dị ứng/kiêng khem)
+            if ingredient_tags:
+                ingredient_map = {
+                    "beef": "có thịt bò",
+                    "pork": "có thịt heo",
+                    "chicken": "có thịt gà",
+                    "seafood": "có hải sản",
+                    "shrimp": "có tôm",
+                    "crab": "có cua",
+                    "squid": "có mực",
+                    "clam": "có nghêu/sò",
+                    "fish": "có cá",
+                    "egg": "có trứng",
+                    "milk": "có sữa",
+                    "peanut": "có đậu phộng",
+                    "soy": "có đậu nành/đậu phụ"
+                }
+                ingredient_labels = [
+                    ingredient_map.get(tag.lower(), tag) 
+                    for tag in ingredient_tags 
+                    if tag.lower() in ingredient_map
+                ]
+                if ingredient_labels:
+                    text_parts.append(f"Nguyên liệu: {', '.join(ingredient_labels)}")
+            
+            # Temperature context (semantic cho query kiểu "trời lạnh ăn gì nóng")
+            category = dish.get("category", "").lower()
+            name_lower = (dish.get("name") or "").lower()
+            desc_lower = (dish.get("description") or "").lower()
+            
+            hot_items = ["cháo", "soup", "canh", "lẩu", "phở", "bún", "miến", "nước dùng", "hot pot"]
+            if any(item in category or item in name_lower or item in desc_lower for item in hot_items):
+                text_parts.append("Món nóng, ấm bụng, phù hợp trời lạnh")
+            
+            # Price context (nếu có)
+            if dish.get("price"):
+                price = dish.get("price")
+                # Có thể thêm context về giá nếu cần
+                # text_parts.append(f"Giá: {price}")
+            
+            # Restaurant ID (metadata)
+            text_parts.append(f"Nhà hàng ID: {restaurant_id}")
+            
             return "\n".join(text_parts)
 
         except Exception as e:
@@ -1393,32 +1698,45 @@ class VectorService:
         """Semantic search cho tables (menus collection, type=table)."""
         try:
             query_vector = self.encode_text(query)
-            filter_obj = None
-            if restaurant_id:
-                filter_obj = Filter(must=[
-                    FieldCondition(key="restaurant_id", match=MatchValue(value=restaurant_id)),
-                    FieldCondition(key="type", match=MatchValue(value="table")),
-                ])
-            else:
-                filter_obj = Filter(must=[
-                    FieldCondition(key="type", match=MatchValue(value="table")),
-                ])
+            if not query_vector:
+                return []
+            
+            # ✅ FIX: Bỏ filter parameter (Qdrant local mode không hỗ trợ)
+            # Search nhiều hơn để có đủ kết quả sau khi filter
             results = self.client.search(
                 collection_name=self.MENUS_COLLECTION,
                 query_vector=query_vector,
-                filter=filter_obj,
-                limit=limit*5,
-                score_threshold=distance_threshold,
+                limit=limit * 5,
             )
+            
+            # Format results
             tables = [
                 dict(result.payload, distance=result.score, id=result.id)
                 for result in results
-                if result.score is None or result.score < distance_threshold or distance_threshold >= 1.0
             ]
-            # Manual filter lại nếu cần
-            if restaurant_id:
-                tables = [t for t in tables if str(t.get("restaurant_id")) == str(restaurant_id)]
-            return tables[:limit]
+            
+            # ✅ FIX: Manual filter theo type=table
+            tables = [
+                t for t in tables
+                if t.get("type") == "table" or t.get("metadata", {}).get("type") == "table"
+            ]
+            
+            # ✅ FIX: Manual filter theo restaurant_id nếu có
+            if restaurant_id is not None:
+                tables = [
+                    t for t in tables
+                    if str(t.get("restaurant_id")) == str(restaurant_id) or 
+                       str(t.get("metadata", {}).get("restaurant_id")) == str(restaurant_id)
+                ]
+            
+            # FILTER theo distance threshold - CHỈ lấy results "gần gần"
+            filtered_tables = [
+                t for t in tables
+                if t.get("distance", 999) < distance_threshold
+            ]
+            
+            # Giới hạn lại số lượng sau khi filter
+            return filtered_tables[:limit]
         except Exception as e:
             logger.error(f"Error searching tables: {e}")
             return []
@@ -1428,32 +1746,45 @@ class VectorService:
         """Semantic search cho table_layout (image_url collection), luôn filter theo type=table_layout."""
         try:
             query_vector = self.encode_text(query)
-            filter_obj = None
-            if restaurant_id:
-                filter_obj = Filter(must=[
-                    FieldCondition(key="restaurant_id", match=MatchValue(value=restaurant_id)),
-                    FieldCondition(key="type", match=MatchValue(value="table_layout")),
-                ])
-            else:
-                filter_obj = Filter(must=[
-                    FieldCondition(key="type", match=MatchValue(value="table_layout")),
-                ])
+            if not query_vector:
+                return []
+            
+            # ✅ FIX: Bỏ filter parameter (Qdrant local mode không hỗ trợ)
+            # Search nhiều hơn để có đủ kết quả sau khi filter
             results = self.client.search(
                 collection_name=self.IMAGE_URL_COLLECTION,
                 query_vector=query_vector,
-                filter=filter_obj,
-                limit=limit*5,
-                score_threshold=distance_threshold,
+                limit=limit * 5,
             )
+            
+            # Format results
             layouts = [
                 dict(result.payload, distance=result.score, id=result.id)
                 for result in results
-                if result.score is None or result.score < distance_threshold or distance_threshold >= 1.0
             ]
-            # Manual filter lại nếu cần
-            if restaurant_id:
-                layouts = [t for t in layouts if str(t.get("restaurant_id")) == str(restaurant_id)]
-            return layouts[:limit]
+            
+            # ✅ FIX: Manual filter theo type=table_layout
+            layouts = [
+                l for l in layouts
+                if l.get("type") == "table_layout" or l.get("metadata", {}).get("type") == "table_layout"
+            ]
+            
+            # ✅ FIX: Manual filter theo restaurant_id nếu có
+            if restaurant_id is not None:
+                layouts = [
+                    l for l in layouts
+                    if str(l.get("restaurant_id")) == str(restaurant_id) or
+                       str(l.get("metadata", {}).get("restaurant_id")) == str(restaurant_id)
+                ]
+            
+            # FILTER theo distance threshold - CHỈ lấy results "gần gần"
+            filtered_layouts = [
+                l for l in layouts
+                if l.get("distance", 999) < distance_threshold
+            ]
+            
+            # Giới hạn lại số lượng sau khi filter
+            return filtered_layouts[:limit]
         except Exception as e:
             logger.error(f"Error searching table_layouts/images: {e}")
             return []

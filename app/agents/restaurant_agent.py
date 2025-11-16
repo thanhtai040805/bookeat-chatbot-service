@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 from app.models import MessageRequest, MessageResponse
 from app.services.vector_intent_service import vector_intent_service
 from app.services.function_service import FunctionService
 from app.services.vector_service import vector_service
+from app.services.menu_reasoning_service import menu_reasoning_service
 from app.core.config import settings
 from openai import OpenAI
 
@@ -29,8 +31,9 @@ class RestaurantAgent:
 CRITICAL RULES - NEVER VIOLATE:
 1. ONLY mention restaurants/dishes/services that are EXPLICITLY listed in the provided data
 2. NEVER create or invent restaurant names, dish names, or any information
-3. If data is not available, say "Không tìm thấy thông tin" - DO NOT make up information
-4. Always verify information exists in provided data before mentioning it
+3. ✅ If data IS available in the provided list → MUST mention at least some restaurants/dishes
+4. ✅ Chỉ được trả "Không tìm thấy thông tin" khi không có bất kỳ món hoặc nhà hàng nào trong danh sách dữ liệu
+5. Always verify information exists in provided data before mentioning it
 
 Your capabilities:
 - Provide accurate information based on REAL DATA provided
@@ -112,10 +115,23 @@ Your capabilities:
             await self._update_turn_state(user_id, intent_result["intent"], entities, response)
             
             # 5. Learn from interaction
-            await self.intent_service.learn_from_interaction(
-                payload.userId, payload.message, intent_result["intent"], 
-                entities, response_success
-            )
+            # ✅ FIX: Không học sai khi pattern đã match nhưng LLM trả general_inquiry
+            intent_method = intent_result.get("method", "")
+            intent_name = intent_result["intent"]
+            
+            # Nếu pattern đã override LLM general_inquiry → không học với general_inquiry
+            if (intent_method in ["pattern_override_llm_general", "pattern_override_llm_low_confidence"] and
+                intent_name == "general_inquiry"):
+                logger.info(
+                    f"Skipping learning: pattern overrode LLM general_inquiry, "
+                    f"not learning incorrect intent"
+                )
+                # Không gọi learn_from_interaction để tránh học sai
+            else:
+                await self.intent_service.learn_from_interaction(
+                    payload.userId, payload.message, intent_name, 
+                    entities, response_success
+                )
             
             # 6. Store in memory
             self._store_conversation(conversation_id, payload.message, response)
@@ -427,81 +443,59 @@ Your capabilities:
     
     async def _detect_required_collections(self, user_message: str, intent_result: Dict) -> List[str]:
         """
-        Detect các collections cần query dựa trên user message
+        Detect các collections cần query dựa trên INTENT (semantic-first)
+        
+        ✅ ĐÃ BỎ KEYWORD DETECTION - Dựa vào intent đã được recognize
+        Chỉ giữ keyword detection như fallback cuối cùng nếu intent không rõ
         
         Returns:
             List of collection names: ['restaurants', 'menus', 'tables', 'image_url', ...]
         """
         collections = []
-        message_lower = user_message.lower()
-        
-        # Detect keywords
-        restaurant_keywords = ['nhà hàng', 'restaurant', 'quán', 'địa chỉ', 'cuisine', 'ẩm thực']
-        menu_keywords = ['menu', 'thực đơn', 'món', 'dish', 'food', 'ăn gì', 'đồ ăn']
-        service_keywords = ['dịch vụ', 'service', 'phục vụ', 'tiện ích', 'tổ chức tiệc', 'sinh nhật', 'birthday', 'party', 'event', 'sự kiện']
-        table_keywords = ['bàn', 'table', 'availability', 'available', 'chỗ ngồi', 'seatcount', 'sức chứa', 'loại bàn']
-        layout_keywords = ['sơ đồ', 'layout', 'ảnh', 'image', 'hình ảnh', 'phòng', 'room', 'không gian', 'vị trí', 'location']
-        
-        # Check intent first
         intent = intent_result.get("intent", "")
+        confidence = intent_result.get("confidence", 0.0)
         
+        # ✅ SEMANTIC-FIRST: Dựa vào intent đã được recognize (không dùng keywords)
         if intent == "restaurant_search":
             collections.append("restaurants")
-            # Nếu message có menu keywords → thêm menus
-            if any(kw in message_lower for kw in menu_keywords):
-                collections.append("menus")
-            # Nếu message có service keywords → thêm menus (services stored in menus collection)
-            if any(kw in message_lower for kw in service_keywords):
-                if "menus" not in collections:
-                    collections.append("menus")
-            # Nếu message có table keywords → thêm menus (tables stored in menus collection)
-            if any(kw in message_lower for kw in table_keywords):
-                if "menus" not in collections:
-                    collections.append("menus")
-            # Nếu message có layout keywords → thêm image_url
-            if any(kw in message_lower for kw in layout_keywords):
-                collections.append("image_url")
+            # Menu inquiry thường đi kèm với restaurant search → thêm menus để có context
+            collections.append("menus")
+            # Layout/table info thường cần cho restaurant search → thêm image_url
+            collections.append("image_url")
         
         elif intent == "menu_inquiry":
             collections.append("menus")
-            # Nếu message có restaurant keywords → thêm restaurants
-            if any(kw in message_lower for kw in restaurant_keywords):
-                collections.append("restaurants")
-            # Nếu message có table keywords → thêm menus tables
-            if any(kw in message_lower for kw in table_keywords):
-                pass  # tables đã trong menus
-            # Nếu message có layout keywords → thêm image_url
-            if any(kw in message_lower for kw in layout_keywords):
-                collections.append("image_url")
-        
-        elif intent == "check_availability":
+            # Menu cần restaurant context → thêm restaurants
             collections.append("restaurants")
-            if "menus" not in collections:
-                collections.append("menus")  # tables nằm trong menus
-            if any(kw in message_lower for kw in layout_keywords):
-                collections.append("image_url")
+            # Có thể có table/layout info → thêm image_url
+            collections.append("image_url")
+        
+        elif intent == "table_inquiry":
+            collections.append("menus")  # Tables stored in menus collection
+            collections.append("restaurants")  # Need restaurant context
+            collections.append("image_url")  # Table layouts
+        
+        elif intent == "voucher_inquiry":
+            collections.append("restaurants")  # Vouchers associated with restaurants
         
         else:
-            # General query - detect multi-intent
-            if any(kw in message_lower for kw in restaurant_keywords):
-                collections.append("restaurants")
-            if any(kw in message_lower for kw in menu_keywords):
-                collections.append("menus")
-            if any(kw in message_lower for kw in service_keywords):
-                if "menus" not in collections:
-                    collections.append("menus")  # Services stored in menus collection
-            if any(kw in message_lower for kw in table_keywords):
-                if "menus" not in collections:
-                    collections.append("menus")  # Tables stored in menus collection
-            if any(kw in message_lower for kw in layout_keywords):
-                collections.append("image_url")
+            # General query hoặc intent không rõ → search tất cả collections
+            # (Semantic search sẽ tự filter kết quả phù hợp)
+            collections = ["restaurants", "menus", "image_url"]
         
-        # Nếu không detect được → default to restaurants
+        # ✅ FALLBACK: Nếu intent confidence quá thấp (<0.3) → search tất cả
+        if confidence < 0.3:
+            logger.debug(f"Low intent confidence ({confidence}), searching all collections")
+            collections = ["restaurants", "menus", "image_url"]
+        
+        # Đảm bảo có ít nhất 1 collection
         if not collections:
             collections.append("restaurants")
         
-        logger.debug(f"Detected collections for query: {collections}")
-        return list(set(collections))
+        # Remove duplicates và return
+        unique_collections = list(set(collections))
+        logger.debug(f"Detected collections (intent-based): {unique_collections} for intent: {intent} (confidence: {confidence})")
+        return unique_collections
     
     async def _multi_collection_search(
         self, 
@@ -621,6 +615,287 @@ Your capabilities:
         if lowered_keys & table_indicators:
             return "table"
         return "menu"
+
+    def _extract_forbidden_tags(self, reasoning_profile: Dict[str, Any]) -> List[str]:
+        """
+        Extract forbidden tags từ reasoning profile
+        
+        ✅ CẢI THIỆN: Detect condition để chỉ filter đúng những gì cần thiết, không quá gắt.
+        
+        Strategy:
+        1. Detect condition từ summary/constraints_text (sẹo, ăn chay, gout, tiểu đường...)
+        2. Map condition → forbidden tags cụ thể (ví dụ: sẹo chỉ kiêng bò + hải sản, KHÔNG kiêng tất cả thịt)
+        
+        Args:
+            reasoning_profile: Profile từ LLM reasoning
+            
+        Returns:
+            List of forbidden tags (e.g., ["beef", "seafood", "tôm", "cua", ...])
+        """
+        forbidden_tags = []
+        constraints_text = reasoning_profile.get("constraints_text", [])
+        summary = (reasoning_profile.get("summary", "") or "").lower()
+        constraints_text_str = " ".join(str(c) for c in constraints_text).lower()
+        
+        # ✅ Detect condition từ summary và constraints để map đúng
+        is_scar_condition = any(keyword in summary for keyword in [
+            "sẹo", "vết mổ", "mới phẫu thuật", "phẫu thuật", "vết thương"
+        ]) or any(keyword in constraints_text_str for keyword in ["sẹo", "vết mổ"])
+        
+        is_vegetarian = any(keyword in summary for keyword in [
+            "ăn chay", "đồ chay", "vegetarian", "vegan"
+        ]) or any(keyword in constraints_text_str for keyword in [
+            "ăn chay", "đồ chay", "không ăn thịt"
+        ])
+        
+        is_gout = any(keyword in summary for keyword in ["gout", "đau khớp"]) or any(
+            keyword in constraints_text_str for keyword in ["gout", "đau khớp", "thịt đỏ"]
+        )
+        
+        # Map constraint text → tags (theo từng constraint cụ thể)
+        for constraint in constraints_text:
+            constraint_lower = str(constraint).lower()
+            
+            # ========== THỊT BÒ ==========
+            if any(keyword in constraint_lower for keyword in ["tránh thịt bò", "kiêng bò", "không bò", "tránh bò"]):
+                forbidden_tags.extend(["beef", "thịt bò", "bò"])
+            
+            # ========== HẢI SẢN (tổng quát) ==========
+            if any(keyword in constraint_lower for keyword in ["tránh hải sản", "kiêng hải sản", "không hải sản"]):
+                forbidden_tags.extend([
+                    "seafood", "hải sản",
+                    "shrimp", "tôm",
+                    "crab", "cua",
+                    "squid", "mực",
+                    "clam", "nghêu",
+                    "scallop", "sò", "sò điệp",
+                    "snail", "ốc",
+                    "oyster", "hàu"
+                ])
+            
+            # Tôm cụ thể
+            if "tránh tôm" in constraint_lower or "kiêng tôm" in constraint_lower:
+                forbidden_tags.extend(["shrimp", "tôm"])
+            
+            # Cua cụ thể
+            if "tránh cua" in constraint_lower or "kiêng cua" in constraint_lower:
+                forbidden_tags.extend(["crab", "cua"])
+            
+            # Mực cụ thể
+            if "tránh mực" in constraint_lower or "kiêng mực" in constraint_lower:
+                forbidden_tags.extend(["squid", "mực"])
+            
+            # ========== CAY ==========
+            if any(keyword in constraint_lower for keyword in [
+                "không cay", "tránh cay", "kiêng cay", "không quá cay", 
+                "ít cay", "hạn chế cay", "không ớt"
+            ]):
+                forbidden_tags.extend(["spicy", "cay", "ớt", "pepper", "chili"])
+            
+            # ========== ĐỒ CHIÊN XÀO ==========
+            if any(keyword in constraint_lower for keyword in [
+                "tránh đồ chiên", "tránh đồ xào", "kiêng chiên xào",
+                "hạn chế đồ chiên xào", "không chiên", "không xào"
+            ]):
+                forbidden_tags.extend(["fried", "deep_fried", "chiên", "xào", "pan_fried"])
+            
+            # ========== ĐƯỜNG / NGỌT (tiểu đường) ==========
+            if any(keyword in constraint_lower for keyword in [
+                "ít đường", "không đường", "tránh đường", "kiêng đường",
+                "tránh đồ ngọt", "ít ngọt", "không ngọt", "tiểu đường"
+            ]):
+                forbidden_tags.extend(["sweet", "dessert", "sugar", "đường", "ngọt", "caramel"])
+            
+            # ========== MUỐI / MẶN (huyết áp cao) ==========
+            if any(keyword in constraint_lower for keyword in [
+                "ít muối", "không muối", "tránh muối", "huyết áp cao",
+                "tăng huyết áp", "ít mặn", "không mặn"
+            ]):
+                forbidden_tags.extend(["mặn", "muối", "salty"])  # Fallback cho text matching
+            
+            # ========== RƯỢU ==========
+            if any(keyword in constraint_lower for keyword in [
+                "tránh rượu", "kiêng rượu", "không rượu", "gan yếu", "viêm gan"
+            ]):
+                forbidden_tags.extend(["alcohol", "rượu", "beer", "bia", "wine"])
+        
+        # ========== ĐIỀU KIỆN ĐẶC BIỆT ==========
+        # ✅ SẸO / VẾT MỔ: Chỉ kiêng bò + hải sản (KHÔNG kiêng tất cả thịt)
+        if is_scar_condition:
+            # Chỉ add bò + hải sản nếu chưa có (tránh duplicate)
+            if "beef" not in forbidden_tags and "thịt bò" not in forbidden_tags:
+                forbidden_tags.extend(["beef", "thịt bò", "bò"])
+            if "seafood" not in forbidden_tags and "hải sản" not in forbidden_tags:
+                forbidden_tags.extend([
+                    "seafood", "hải sản",
+                    "shrimp", "tôm",
+                    "crab", "cua",
+                    "squid", "mực",
+                    "clam", "nghêu",
+                    "scallop", "sò", "sò điệp",
+                    "snail", "ốc",
+                    "oyster", "hàu"
+                ])
+            # ✅ QUAN TRỌNG: Không add "meat", "thịt", "pork", "chicken" cho sẹo
+        
+        # ✅ ĂN CHAY: Kiêng tất cả thịt
+        if is_vegetarian:
+            forbidden_tags.extend([
+                "beef", "pork", "chicken", "meat",
+                "thịt bò", "thịt heo", "thịt gà", "thịt"
+            ])
+        
+        # ✅ GOUT / ĐAU KHỚP: Chỉ kiêng thịt đỏ
+        if is_gout:
+            forbidden_tags.extend(["beef", "thịt bò", "pork", "thịt heo", "lamb", "thịt cừu"])
+        
+        # ✅ Note: "tránh thịt" generic - chỉ apply nếu không phải sẹo/gout (để tránh conflict)
+        if not is_scar_condition and not is_gout:
+            for constraint in constraints_text:
+                constraint_lower = str(constraint).lower()
+                if any(keyword in constraint_lower for keyword in [
+                    "không thịt", "tránh thịt", "kiêng thịt", "không có thịt"
+                ]):
+                    if "meat" not in forbidden_tags and "thịt" not in forbidden_tags:
+                        forbidden_tags.extend(["beef", "pork", "chicken", "meat", "thịt bò", "thịt heo", "thịt gà", "thịt"])
+        
+        # Remove duplicates và return
+        return list(set(forbidden_tags))
+    
+    def _filter_by_forbidden_tags(
+        self, search_results: Dict[str, List[Dict]], forbidden_tags: List[str]
+    ) -> Dict[str, List[Dict]]:
+        """
+        Filter search results loại bỏ món có forbidden tags
+        
+        Strategy:
+        - Check tags trong metadata
+        - Check name, description, ingredients cho forbidden keywords
+        - Chỉ filter menus, giữ nguyên restaurants/services
+        
+        Args:
+            search_results: Dict với keys là collection names, values là list of results
+            forbidden_tags: List of tags/keywords cần tránh
+            
+        Returns:
+            Filtered search_results
+        """
+        if not forbidden_tags:
+            return search_results
+        
+        filtered = {}
+        
+        for collection_name, results in search_results.items():
+            if collection_name == "menus":
+                # Filter menus - loại bỏ món có forbidden tags/keywords
+                filtered_items = []
+                
+                for item in results:
+                    metadata = item.get("metadata", {})
+                    
+                    # Get tags (ensure it's a list)
+                    tags = metadata.get("tags", [])
+                    if isinstance(tags, str):
+                        try:
+                            import ast
+                            tags = ast.literal_eval(tags) if tags.startswith("[") else [tags]
+                        except:
+                            tags = [tags] if tags else []
+                    if not isinstance(tags, list):
+                        tags = []
+                    
+                    # ✅ Get ingredient_tags (MỚI - dùng cho dị ứng/kiêng khem)
+                    ingredient_tags = metadata.get("ingredient_tags", [])
+                    if isinstance(ingredient_tags, str):
+                        try:
+                            import ast
+                            ingredient_tags = ast.literal_eval(ingredient_tags) if ingredient_tags.startswith("[") else [ingredient_tags]
+                        except:
+                            ingredient_tags = [ingredient_tags] if ingredient_tags else []
+                    if not isinstance(ingredient_tags, list):
+                        ingredient_tags = []
+                    
+                    # Get text fields để check (fallback nếu không có tags)
+                    name = (metadata.get("name") or "").lower()
+                    description = (metadata.get("description") or "").lower()
+                    ingredients = metadata.get("ingredients", "")
+                    if isinstance(ingredients, str):
+                        ingredients = ingredients.lower()
+                    elif isinstance(ingredients, list):
+                        ingredients = " ".join(str(i) for i in ingredients).lower()
+                    else:
+                        ingredients = ""
+                    
+                    # Check nếu có forbidden tag/keyword
+                    has_forbidden = False
+                    for forbidden in forbidden_tags:
+                        forbidden_lower = forbidden.lower()
+                        
+                        # ✅ Priority 1: Check trong ingredient_tags (CHÍNH XÁC NHẤT)
+                        if any(forbidden_lower == tag.lower() for tag in ingredient_tags):
+                            has_forbidden = True
+                            break
+                        
+                        # ✅ Priority 2: Check trong tags (health/lifestyle tags)
+                        if any(forbidden_lower == tag.lower() for tag in tags):
+                            has_forbidden = True
+                            break
+                        
+                        # ✅ Priority 3: Check trong name, description, ingredients (fallback)
+                        if forbidden_lower in name or forbidden_lower in description or forbidden_lower in ingredients:
+                            has_forbidden = True
+                            break
+                    
+                    # Chỉ giữ món không có forbidden tags
+                    if not has_forbidden:
+                        filtered_items.append(item)
+                    else:
+                        logger.debug(
+                            f"Filtered out menu item '{metadata.get('name', 'N/A')}' "
+                            f"due to forbidden tags: {forbidden_tags}"
+                        )
+                
+                filtered[collection_name] = filtered_items
+                logger.info(
+                    f"Filtered menus: {len(results)} → {len(filtered_items)} "
+                    f"(removed {len(results) - len(filtered_items)} items with forbidden tags)"
+                )
+            else:
+                # Giữ nguyên restaurants, services, và các collections khác
+                filtered[collection_name] = results
+        
+        return filtered
+    
+    def _normalize_menu_item(self, dish: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize menu item từ search result format về flat format
+        
+        Handles:
+        - Search result format: {"metadata": {...}, "distance": ..., "score": ...}
+        - Aggregated format: {"name": ..., "description": ..., "_restaurantName": ...}
+        - Direct format: {"name": ..., "description": ...}
+        
+        Returns:
+            Normalized dict với tất cả fields ở root level
+        """
+        # Extract metadata nếu có (search result format)
+        if "metadata" in dish and isinstance(dish.get("metadata"), dict):
+            metadata = dish.get("metadata", {})
+            normalized = dict(metadata)  # Copy metadata fields
+            # Preserve enriched fields từ aggregation (như _restaurantName, _restaurantId, distance, score)
+            normalized.update({
+                k: v for k, v in dish.items() 
+                if k not in ["metadata", "document", "id"] and k.startswith("_")
+            })
+            # Preserve distance, score nếu có
+            if "distance" in dish:
+                normalized["distance"] = dish["distance"]
+            if "score" in dish:
+                normalized["score"] = dish["score"]
+            return normalized
+        
+        # Nếu không có metadata → dùng dish trực tiếp (đã là flat format)
+        return dish
 
     def _simplify_matched_item(self, metadata: Dict[str, Any], distance: float, item_type: str) -> Dict[str, Any]:
         meta_copy = dict(metadata or {})
@@ -882,36 +1157,374 @@ Your capabilities:
             highlights.append(f"... và {len(items) - max_items} {label.lower()} khác")
         return f"{label}: " + "; ".join(highlights)
     
+    async def _extract_restaurants_from_history(self, user_id: str) -> List[Dict]:
+        """
+        Extract restaurants từ conversation history của user
+        
+        Tìm trong assistant messages trong conversation history để extract:
+        - Restaurant names (từ format "1. **Seoul BBQ Premium**")
+        - Restaurant IDs (nếu có)
+        """
+        try:
+            # Lấy recent conversations
+            conversations = await self.vector_service.get_user_conversations_recent(user_id, limit=10)
+            if not conversations:
+                logger.info(f"No conversation history found for user {user_id}")
+                return []
+            
+            restaurants = []
+            seen_names = set()
+            
+            # Patterns để extract restaurant names từ assistant responses
+            # ✅ FIX: Chỉ extract từ list restaurants (có số thứ tự), không extract món ăn
+            patterns = [
+                # Format: "1. **Seoul BBQ Premium**" (có số thứ tự ở đầu)
+                r"\n\s*\d+\.\s+\*\*([^*]+?)\*\*",
+                # Format: "**Seoul BBQ Premium**" (không có "- " hoặc "( " phía trước, không có VNĐ sau)
+                r"(?<![-(\s])\*\*([A-Za-z0-9\s\-]+(?:Restaurant|BBQ|Premium|Restaurants|Cafe|Café|Bar|Bistro)?)\*\*(?!\s*[-\()]|\s*-\s*\d+\.?\d*\s*VN?Đ)",
+                # Format: "NHÀ HÀNG - Tên: Seoul BBQ Premium"
+                r"NHÀ HÀNG\s*-\s*Tên:\s*([A-Za-z0-9\s\-]+?)(?:\s|,|$|Địa)",
+            ]
+            
+            # Tìm trong assistant messages (những message có format list restaurants)
+            for conv in conversations:
+                document = conv.get("document", "")
+                if not document:
+                    continue
+                
+                # Chỉ tìm trong assistant responses (có format markdown với **)
+                if "**" not in document and "NHÀ HÀNG" not in document:
+                    continue
+                
+                # Extract restaurant names
+                for pattern in patterns:
+                    matches = re.finditer(pattern, document, re.IGNORECASE | re.MULTILINE)
+                    for match in matches:
+                        name = match.group(1).strip()
+                        
+                        # ✅ FIX: Validate để loại bỏ món ăn
+                        # 1. Check context xung quanh để loại bỏ món ăn (có VNĐ, giá, "- 50.000")
+                        match_start = match.start()
+                        match_end = match.end()
+                        context_before = document[max(0, match_start - 30):match_start].lower()
+                        context_after = document[match_end:min(len(document), match_end + 50)].lower()
+                        
+                        # Loại bỏ nếu có pattern giá cả (VNĐ, đồng, giá, price) trong context
+                        if any(keyword in context_before or keyword in context_after for keyword in [
+                            "vnđ", "đồng", "giá", "price", "- 50", "- 100", "000", "triệu", "k"
+                        ]):
+                            # Nhưng giữ lại nếu có pattern nhà hàng (Restaurant, BBQ, Premium)
+                            if not any(keyword in name.lower() for keyword in [
+                                "restaurant", "bbq", "premium", "cafe", "café", "bar", "bistro"
+                            ]):
+                                logger.debug(f"Skipping '{name}' - looks like a dish (has price context)")
+                                continue
+                        
+                        # 2. Filter out common words và validate
+                        if (len(name) > 3 and 
+                            name.lower() not in ['có', 'là', 'nào', 'và', 'cho', 'món', 'địa chỉ', 'loại', 'rating', 
+                                                  'canh', 'cá', 'cơm', 'bánh', 'lẩu', 'gỏi', 'chả', 'súp', 'salad'] and
+                            # ✅ Loại bỏ tên món ăn phổ biến (thường ngắn và có từ khóa món ăn)
+                            not any(dish_keyword in name.lower() for dish_keyword in [
+                                'canh', 'súp', 'gỏi', 'chả', 'nem', 'bánh', 'cơm', 'lẩu', 'salad'
+                            ]) and
+                            name not in seen_names):
+                            seen_names.add(name)
+                            restaurants.append({
+                                "name": name,
+                                "id": None  # ID sẽ được tìm sau
+                            })
+                            logger.debug(f"Extracted restaurant name from history: {name}")
+            
+            # Limit to top 5 restaurants (thường user chỉ hỏi về 2-3 restaurants)
+            restaurants = restaurants[:5]
+            logger.info(f"Extracted {len(restaurants)} restaurants from history: {[r['name'] for r in restaurants]}")
+            return restaurants
+            
+        except Exception as e:
+            logger.error(f"Error extracting restaurants from history: {e}", exc_info=True)
+            return []
+    
+    async def _search_restaurants_by_names_or_ids(
+        self, restaurant_names: List[str] = None, restaurant_ids: List[Any] = None
+    ) -> List[Dict]:
+        """
+        Search restaurants theo names hoặc IDs
+        
+        Args:
+            restaurant_names: List of restaurant names
+            restaurant_ids: List of restaurant IDs
+            
+        Returns:
+            List of restaurant dicts
+        """
+        try:
+            restaurants = []
+            
+            # 1. Search by IDs nếu có
+            if restaurant_ids:
+                restaurant_ids = [rid for rid in restaurant_ids if rid is not None]
+                if restaurant_ids:
+                    restaurants_by_ids = await self.vector_service.get_restaurants_by_ids(restaurant_ids)
+                    restaurants.extend(restaurants_by_ids.values())
+                    logger.info(f"Found {len(restaurants_by_ids)} restaurants by IDs")
+            
+            # 2. Search by names nếu có
+            if restaurant_names:
+                restaurant_names = [name for name in restaurant_names if name and name.strip()]
+                if restaurant_names:
+                    # Search từng name với threshold cao hơn (0.6) để catch variations
+                    seen_ids = {self._extract_restaurant_id_from_metadata(r) for r in restaurants}
+                    
+                    for name in restaurant_names:
+                        # Search với name + keywords để tăng accuracy
+                        query = f"{name} nhà hàng restaurant"
+                        results = await self.vector_service.search_restaurants(
+                            query, limit=3, distance_threshold=0.6
+                        )
+                        
+                        for result in results:
+                            result_id = self._extract_restaurant_id_from_metadata(result)
+                            # Check nếu name match (fuzzy)
+                            result_name = result.get("restaurantName") or result.get("name", "")
+                            if (result_id and result_id not in seen_ids and
+                                (name.lower() in result_name.lower() or result_name.lower() in name.lower())):
+                                seen_ids.add(result_id)
+                                restaurants.append(result)
+                                logger.debug(f"Found restaurant by name '{name}': {result_name} (ID: {result_id})")
+            
+            # Remove duplicates
+            seen_ids = set()
+            unique_restaurants = []
+            for r in restaurants:
+                r_id = self._extract_restaurant_id_from_metadata(r)
+                if r_id and r_id not in seen_ids:
+                    seen_ids.add(r_id)
+                    unique_restaurants.append(r)
+            
+            logger.info(f"Found {len(unique_restaurants)} unique restaurants by names/IDs")
+            return unique_restaurants
+            
+        except Exception as e:
+            logger.error(f"Error searching restaurants by names/IDs: {e}", exc_info=True)
+            return []
+    
+    def _normalize_restaurant_item(self, restaurant: Dict) -> Dict:
+        """
+        Normalize restaurant item để extract fields từ metadata nếu cần
+        
+        Tương tự _normalize_menu_item, flatten metadata và ensure fields accessible
+        """
+        if not restaurant:
+            return restaurant
+        
+        # Nếu đã có fields ở top level → return as is
+        if restaurant.get("restaurantName") or restaurant.get("name"):
+            return restaurant
+        
+        # ✅ FIX: Extract từ metadata nếu cần
+        metadata = restaurant.get("metadata", {})
+        if metadata:
+            # Flatten metadata fields lên top level
+            restaurant_normalized = dict(restaurant)
+            
+            # Extract restaurant fields từ metadata
+            if not restaurant_normalized.get("restaurantName") and not restaurant_normalized.get("name"):
+                restaurant_normalized["restaurantName"] = (
+                    metadata.get("restaurantName") 
+                    or metadata.get("name")
+                    or restaurant.get("name")
+                    or "N/A"
+                )
+            
+            if not restaurant_normalized.get("address"):
+                restaurant_normalized["address"] = (
+                    metadata.get("address")
+                    or metadata.get("restaurantAddress")
+                    or restaurant.get("address")
+                    or "N/A"
+                )
+            
+            if not restaurant_normalized.get("cuisineType"):
+                restaurant_normalized["cuisineType"] = (
+                    metadata.get("cuisineType")
+                    or metadata.get("cuisine_type")
+                    or metadata.get("restaurant_cuisine")
+                    or restaurant.get("cuisineType")
+                    or "N/A"
+                )
+            
+            if not restaurant_normalized.get("rating"):
+                restaurant_normalized["rating"] = (
+                    metadata.get("rating")
+                    or metadata.get("restaurantRating")
+                    or restaurant.get("rating")
+                    or "N/A"
+                )
+            
+            # Preserve metadata for other uses
+            restaurant_normalized["metadata"] = metadata
+            
+            return restaurant_normalized
+        
+        return restaurant
+    
+    async def _format_comparison_response(
+        self, user_message: str, restaurants: List[Dict], user_id: str
+    ) -> str:
+        """
+        Format response để so sánh restaurants
+        
+        Args:
+            user_message: User message
+            restaurants: List of restaurants to compare
+            user_id: User ID
+            
+        Returns:
+            Formatted comparison response
+        """
+        try:
+            if not restaurants:
+                return "Xin lỗi, tôi không tìm thấy thông tin về các nhà hàng bạn muốn so sánh."
+            
+            # ✅ FIX: Normalize restaurants trước khi format
+            restaurants_to_compare = []
+            for r in restaurants[:5]:  # Limit to top 5 restaurants
+                normalized = self._normalize_restaurant_item(r)
+                restaurants_to_compare.append(normalized)
+            
+            # Get menus cho các restaurants này
+            restaurant_ids = [
+                self._extract_restaurant_id_from_metadata(r) 
+                for r in restaurants_to_compare
+            ]
+            restaurant_ids = [rid for rid in restaurant_ids if rid is not None]
+            
+            # Get menus for each restaurant
+            menus_by_restaurant = {}
+            for rid in restaurant_ids:
+                menus = await self.vector_service.search_menus(
+                    "", restaurant_id=rid, limit=10, distance_threshold=1.0  # High threshold để lấy tất cả
+                )
+                menus_by_restaurant[rid] = menus
+            
+            # Aggregate menus into restaurants
+            for r in restaurants_to_compare:
+                rid = self._extract_restaurant_id_from_metadata(r)
+                if rid and rid in menus_by_restaurant:
+                    r["_matchedMenus"] = menus_by_restaurant[rid]
+            
+            # Format với AI để so sánh
+            return await self._format_multi_data_with_ai(
+                user_message,
+                restaurants=restaurants_to_compare,
+                menus=[],  # Menus đã được aggregate vào restaurants
+                services=[],
+                user_id=user_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Error formatting comparison response: {e}", exc_info=True)
+            # Fallback to simple format
+            return self._format_multi_data_fallback(restaurants, [], [])
+    
     async def _handle_restaurant_search(
         self, user_message: str, entities: Dict, user_id: str
     ) -> str:
-        """Restaurant search - Two-Step Search: Find Restaurants → Search Related Data by Restaurant IDs"""
+        """
+        Restaurant search với reasoning layer
+        
+        Strategy:
+        0. Detect follow-up questions và extract restaurants từ conversation history
+        1. LLM Reasoning - Phân tích nhu cầu ăn uống (health, diet, constraints)
+        2. Enhanced query - Dùng search_query từ reasoning thay vì raw user_message
+        3. Semantic search với enhanced query
+        4. Filter theo forbidden_tags (nếu có từ reasoning)
+        """
         try:
-            # ✅ STEP 1: Extract restaurant_id nếu có
+            # ✅ STEP 0: Detect follow-up questions (so sánh, bạn vừa gợi ý, etc.)
+            message_lower = user_message.lower()
+            is_follow_up = any(keyword in message_lower for keyword in [
+                "so sánh", "bạn vừa gợi ý", "những nhà hàng trên", "nhà hàng trên",
+                "2 nhà hàng", "hai nhà hàng", "các nhà hàng", "những nhà hàng"
+            ])
+            
+            if is_follow_up:
+                logger.info(f"Detected follow-up question: {user_message[:100]}...")
+                # Extract restaurants từ conversation history
+                restaurants_from_history = await self._extract_restaurants_from_history(user_id)
+                if restaurants_from_history:
+                    logger.info(f"Found {len(restaurants_from_history)} restaurants from history: {[r.get('name', 'N/A') for r in restaurants_from_history]}")
+                    # Search restaurants theo names/IDs từ history
+                    restaurants = await self._search_restaurants_by_names_or_ids(
+                        [r.get("name") for r in restaurants_from_history if r.get("name")],
+                        [r.get("id") for r in restaurants_from_history if r.get("id")]
+                    )
+                    if restaurants:
+                        # Format comparison response
+                        return await self._format_comparison_response(
+                            user_message, restaurants, user_id
+                        )
+                    else:
+                        logger.warning(f"Could not find restaurants by names/IDs from history")
+                        # Fallback to normal search
+            
+            # ✅ STEP 1: LLM Reasoning - Phân tích nhu cầu ăn uống
+            reasoning_profile = await menu_reasoning_service.universal_query_reasoning(user_message)
+            logger.info(
+                f"Restaurant search reasoning: summary='{reasoning_profile.get('summary', 'N/A')}', "
+                f"constraints_text={reasoning_profile.get('constraints_text', [])}, "
+                f"diet_profile={reasoning_profile.get('diet_profile', {})}"
+            )
+            
+            # ✅ STEP 2: Tạo enhanced query từ reasoning
+            search_query = reasoning_profile.get("search_query", "").strip()
+            summary = reasoning_profile.get("summary", "").strip()
+            constraints_text = reasoning_profile.get("constraints_text", [])
+            
+            # Build enhanced query: search_query > summary > user_message
+            if search_query:
+                enhanced_query = search_query
+                if summary and summary != search_query:
+                    enhanced_query += f". {summary}"
+            elif summary:
+                enhanced_query = summary
+            else:
+                enhanced_query = user_message
+            
+            logger.debug(f"Restaurant search enhanced query: {enhanced_query[:100]}...")
+            
+            # ✅ STEP 3: Extract restaurant_id nếu có
             restaurant_id = entities.get("restaurant_id")
             
-            # 1. Detect các collections cần query
+            # ✅ STEP 4: Detect collections cần query
             intent_result = {"intent": "restaurant_search"}
             collections = await self._detect_required_collections(
                 user_message, intent_result
             )
             
-            # ✅ STEP 2: Multi-collection search WITH restaurant_id filter (nếu có)
+            # ✅ STEP 5: Multi-collection search với enhanced query (thay vì raw user_message)
             search_results = await self._multi_collection_search(
-                user_message,
+                enhanced_query,  # ← Dùng enhanced query từ reasoning
                 collections,
                 distance_threshold=0.5,  # CHỈ lấy results gần
                 limit_per_collection=20,
                 restaurant_id=restaurant_id  # ✅ Pass restaurant_id để filter (None nếu generic search)
             )
             
-            # ✅ STEP 3: Aggregate cross-collection data để liên kết món ăn/dịch vụ ↔ nhà hàng
+            # ✅ STEP 6: Filter theo forbidden_tags (nếu có từ reasoning)
+            forbidden_tags = self._extract_forbidden_tags(reasoning_profile)
+            if forbidden_tags:
+                logger.info(f"Filtering by forbidden_tags: {forbidden_tags}")
+                search_results = self._filter_by_forbidden_tags(search_results, forbidden_tags)
+            
+            # ✅ STEP 7: Aggregate cross-collection data để liên kết món ăn/dịch vụ ↔ nhà hàng
             aggregated = await self._aggregate_search_results(search_results)
             restaurants_enriched = aggregated.get("restaurants", [])
             menus_enriched = aggregated.get("menus", [])
             services_enriched = aggregated.get("services", [])
 
-            # ✅ STEP 4: Apply entity filters trên aggregated data
+            # ✅ STEP 8: Apply entity filters trên aggregated data
             if entities.get("cuisine_type"):
                 cuisine = entities["cuisine_type"].lower()
                 restaurants_enriched = [
@@ -942,11 +1555,11 @@ Your capabilities:
                     if self._extract_restaurant_id_from_metadata(s) in allowed_ids
                 ]
 
-            # ✅ STEP 5: Nếu không có data → Không hallucinate
+            # ✅ STEP 9: Nếu không có data → Không hallucinate
             if not restaurants_enriched and not menus_enriched and not services_enriched:
                 return "Xin lỗi, tôi không tìm thấy thông tin phù hợp. Bạn có thể thử tìm kiếm với từ khóa khác không?"
 
-            # ✅ STEP 6: Format với AI - Đưa TẤT CẢ data vào
+            # ✅ STEP 10: Format với AI - Đưa TẤT CẢ data vào
             return await self._format_multi_data_with_ai(
                 user_message,
                 restaurants=restaurants_enriched,
@@ -962,9 +1575,23 @@ Your capabilities:
     async def _handle_menu_inquiry(
         self, user_message: str, entities: Dict, user_id: str
     ) -> str:
-        """Menu inquiry - Two-Step Search: Find Restaurant → Search Menus by Restaurant ID"""
+        """
+        Menu inquiry với SEMANTIC REASONING
+        
+        ✅ MỚI: Dùng LLM reasoning để sinh structured profile
+        ✅ MỚI: Dùng semantic_menu_search_with_reasoning() để search với reasoning
+        """
         try:
-            # ✅ STEP 1: Find restaurant first to get restaurant_id
+            # ✅ STEP 1: LLM Reasoning - Sinh structured profile (thay vì keywords)
+            reasoning_profile = await menu_reasoning_service.universal_query_reasoning(user_message)
+            logger.info(
+                f"Menu reasoning profile: summary='{reasoning_profile.get('summary', 'N/A')}', "
+                f"constraints_text={reasoning_profile.get('constraints_text', [])}, "
+                f"diet_profile={reasoning_profile.get('diet_profile', {})}, "
+                f"search_query='{reasoning_profile.get('search_query', '')[:80]}...'"
+            )
+            
+            # ✅ STEP 2: Find restaurant first to get restaurant_id
             restaurant_id = None
             
             if entities.get("restaurant_id"):
@@ -979,55 +1606,98 @@ Your capabilities:
                         restaurant_results[0]["metadata"]
                     )
             
-            # ✅ STEP 2: Detect collections
-            intent_result = {"intent": "menu_inquiry"}
-            collections = await self._detect_required_collections(
-                user_message, intent_result
+            # ✅ STEP 3: Semantic menu search với reasoning (PRIMARY METHOD)
+            menus_enriched = await self.vector_service.semantic_menu_search_with_reasoning(
+                user_message,
+                reasoning_profile,
+                restaurant_id=restaurant_id,
+                limit=30,
+                distance_threshold=0.6
             )
             
-            # ✅ STEP 3: Multi-collection search WITH restaurant_id filter
-            search_results = await self._multi_collection_search(
-                user_message,
-                collections,
-                distance_threshold=0.5,
-                limit_per_collection=30,
-                restaurant_id=restaurant_id  # ✅ Pass restaurant_id để filter
-            )
+            # ✅ STEP 3.5: Filter theo forbidden_tags (nếu có từ reasoning)
+            forbidden_tags = self._extract_forbidden_tags(reasoning_profile)
+            if forbidden_tags:
+                logger.info(f"Menu inquiry: Filtering by forbidden_tags: {forbidden_tags}")
+                # Convert menus_enriched to search_results format để dùng filter
+                filtered_search_results = {"menus": menus_enriched}
+                filtered_search_results = self._filter_by_forbidden_tags(filtered_search_results, forbidden_tags)
+                menus_enriched = filtered_search_results.get("menus", menus_enriched)
+                logger.info(f"Menu inquiry: Filtered results: {len(menus_enriched)} menu items after filtering")
             
-            aggregated = await self._aggregate_search_results(search_results)
-            restaurants_enriched = aggregated.get("restaurants", [])
-            menus_enriched = aggregated.get("menus", [])
-            services_enriched = aggregated.get("services", [])
+            # ✅ STEP 4: Get restaurant context nếu cần
+            restaurants_enriched = []
+            if restaurant_id:
+                # Get restaurant details
+                restaurants = await self.vector_service.get_restaurants_by_ids([restaurant_id])
+                if restaurant_id in restaurants:
+                    restaurants_enriched.append(restaurants[restaurant_id])
+            elif menus_enriched:
+                # Extract restaurant IDs từ menu results
+                restaurant_ids = set()
+                for menu in menus_enriched:
+                    rid = menu.get("metadata", {}).get("restaurant_id")
+                    if rid:
+                        restaurant_ids.add(rid)
+                
+                if restaurant_ids:
+                    restaurants = await self.vector_service.get_restaurants_by_ids(list(restaurant_ids))
+                    restaurants_enriched = list(restaurants.values())
+            
+            # ✅ STEP 5: Format response với enriched data
+            # ✅ FIX: Log để debug
+            logger.info(f"Menu inquiry: Final menus_enriched count: {len(menus_enriched)}")
+            
+            if not menus_enriched:
+                logger.warning(f"Menu inquiry: No menus found after reasoning and filtering")
+                return "Xin lỗi, tôi không tìm thấy món ăn phù hợp với yêu cầu của bạn. Bạn có thể thử tìm kiếm với tiêu chí khác không?"
 
-            # ✅ Additional filter nếu có restaurant_id từ entities
-            if restaurant_id is not None:
-                target_id = restaurant_id
-                restaurants_enriched = [
-                    r for r in restaurants_enriched
-                    if self._extract_restaurant_id_from_metadata(r) == target_id
-                ]
-                menus_enriched = [
-                    m for m in menus_enriched
-                    if self._extract_restaurant_id_from_metadata(m) == target_id
-                ]
-                services_enriched = [
-                    s for s in services_enriched
-                    if self._extract_restaurant_id_from_metadata(s) == target_id
-                ]
-
-            if not menus_enriched and not services_enriched:
-                return "Xin lỗi, tôi không tìm thấy thực đơn phù hợp. Bạn có thể thử tìm kiếm với từ khóa khác không?"
-
-            return await self._format_multi_data_with_ai(
-                user_message,
-                restaurants=restaurants_enriched,
-                menus=menus_enriched,
-                services=services_enriched,
-                user_id=user_id
-            )
+            # ✅ FIX: Ưu tiên dùng kết quả reasoning (menus_enriched đã có 16 món theo log)
+            try:
+                return await self._format_multi_data_with_ai(
+                    user_message,
+                    restaurants=restaurants_enriched,
+                    menus=menus_enriched,  # ← Dùng kết quả reasoning (đã có 16 món)
+                    services=[],  # Services không được search trong reasoning mode (có thể thêm sau)
+                    user_id=user_id
+                )
+            except Exception as format_error:
+                logger.error(f"Error formatting response with reasoning results: {format_error}", exc_info=True)
+                # ✅ FIX: Nếu format fail nhưng vẫn có menus_enriched → thử format lại với fallback formatter
+                return await self._format_multi_data_fallback(
+                    restaurants=restaurants_enriched,
+                    menus=menus_enriched,  # ← Vẫn dùng kết quả reasoning
+                    services=[]
+                )
             
         except Exception as e:
             logger.error(f"Error in _handle_menu_inquiry: {e}", exc_info=True)
+            # ✅ FIX: Không fallback sang basic search nếu đã có kết quả reasoning
+            # Chỉ fallback nếu thực sự không có gì
+            # Fallback to old method nếu có lỗi nghiêm trọng (không phải lỗi format)
+            try:
+                # Fallback: Regular search không có reasoning (chỉ khi thực sự cần)
+                restaurant_id = entities.get("restaurant_id")
+                if restaurant_id:
+                    logger.warning(f"Menu inquiry: Falling back to basic search for restaurant_id={restaurant_id}")
+                    menus_enriched = await self.vector_service.search_menus(
+                        user_message,
+                        restaurant_id=restaurant_id,
+                        limit=30,
+                        distance_threshold=0.6
+                    )
+                    if menus_enriched:
+                        logger.info(f"Menu inquiry: Fallback search found {len(menus_enriched)} menus")
+                        return await self._format_multi_data_with_ai(
+                            user_message,
+                            restaurants=[],
+                            menus=menus_enriched,
+                            services=[],
+                            user_id=user_id
+                        )
+            except Exception as fallback_error:
+                logger.error(f"Fallback search also failed: {fallback_error}")
+            
             return "Xin lỗi, không thể lấy thực đơn. Vui lòng thử lại sau."
     
     
@@ -1091,6 +1761,9 @@ Your capabilities:
         menus = menus or []
         services = services or []
         
+        # ✅ FIX: Log để debug
+        logger.info(f"_format_multi_data_with_ai: restaurants={len(restaurants)}, menus={len(menus)}, services={len(services)}")
+        
         # Build STRICT data context cho TẤT CẢ loại data
         data_context_parts = []
         
@@ -1099,6 +1772,9 @@ Your capabilities:
             restaurants_to_show = restaurants[:20] if len(restaurants) > 20 else restaurants
             restaurant_lines: List[str] = []
             for index, r in enumerate(restaurants_to_show, 1):
+                # ✅ FIX: Normalize restaurant item trước khi format
+                r = self._normalize_restaurant_item(r)
+                
                 base_line = (
                     f"{index}. NHÀ HÀNG - Tên: {r.get('restaurantName', r.get('name', 'N/A'))}, "
                     f"Địa chỉ: {r.get('address', 'N/A')}, "
@@ -1131,26 +1807,84 @@ Your capabilities:
             menus_to_show = menus[:30] if len(menus) > 30 else menus
             menu_lines: List[str] = []
             for dish in menus_to_show:
-                dish_name = dish.get("name") or dish.get("dishName") or "N/A"
+                # ✅ FIX: Normalize menu item (extract metadata nếu có)
+                dish = self._normalize_menu_item(dish)
+                
+                # Extract dish info với nhiều fallback options
+                dish_name = (
+                    dish.get("name") 
+                    or dish.get("dishName") 
+                    or dish.get("dish_name")
+                    or "N/A"
+                )
+                
                 price = dish.get("price")
-                restaurant_name = dish.get("_restaurantName") or dish.get("restaurantName")
                 description = dish.get("description")
+                
+                # Restaurant name từ enriched fields hoặc metadata
+                restaurant_name = (
+                    dish.get("_restaurantName")  # Enriched từ aggregation
+                    or dish.get("restaurantName")
+                    or dish.get("restaurant_name")
+                )
+                
+                # Category/type nếu có
+                category = dish.get("category") or dish.get("dishCategory")
+                
+                # Tags nếu có (để hiển thị semantic context)
+                tags = dish.get("tags", [])
+                if isinstance(tags, str):
+                    try:
+                        import ast
+                        tags = ast.literal_eval(tags) if tags.startswith("[") else [tags]
+                    except:
+                        tags = [tags] if tags else []
+                
                 line = f"- MÓN - {dish_name}"
+                
+                # Add restaurant context
                 if restaurant_name:
                     line += f" (Nhà hàng: {restaurant_name})"
+                
+                # Add category nếu có
+                if category:
+                    line += f" [Loại: {category}]"
+                
+                # Add price
                 if price in (None, "", "N/A"):
                     line += ": N/A"
                 else:
                     price_str = str(price)
-                    if "vnđ" not in price_str.lower():
+                    if "vnđ" not in price_str.lower() and "đ" not in price_str.lower() and price_str.strip():
                         price_str += " VNĐ"
                     line += f": {price_str}"
+                
+                # Add description
                 if description:
                     trimmed_desc = description.strip()
                     if len(trimmed_desc) > 80:
                         trimmed_desc = trimmed_desc[:80].rstrip() + "..."
                     line += f" - {trimmed_desc}"
+                
+                # Add tags context nếu có (semantic boost info)
+                if isinstance(tags, list) and tags:
+                    tag_labels = []
+                    tag_map = {
+                        "high_protein": "Giàu protein",
+                        "low_fat": "Ít béo",
+                        "light_meal": "Món nhẹ",
+                        "good_when_sick": "Tốt khi ốm",
+                        "vegetarian": "Chay",
+                        "spicy": "Cay"
+                    }
+                    for tag in tags[:3]:  # Chỉ hiển thị 3 tags đầu
+                        if tag in tag_map:
+                            tag_labels.append(tag_map[tag])
+                    if tag_labels:
+                        line += f" ({', '.join(tag_labels)})"
+                
                 menu_lines.append(line)
+            
             if len(menus) > 30:
                 menu_lines.append(f"... và {len(menus) - 30} món khác.")
             data_context_parts.append("DANH SÁCH MÓN ĂN:\n" + "\n".join(menu_lines))
@@ -1174,7 +1908,11 @@ Your capabilities:
         
         data_context = "\n\n".join(data_context_parts)
         
+        # ✅ FIX: Log để debug
+        logger.info(f"_format_multi_data_with_ai: data_context length={len(data_context)}, parts={len(data_context_parts)}")
+        
         if not data_context:
+            logger.warning(f"_format_multi_data_with_ai: No data_context generated (restaurants={len(restaurants)}, menus={len(menus)}, services={len(services)})")
             return "Không tìm thấy thông tin phù hợp."
         
         # STRICT System Prompt
@@ -1186,7 +1924,9 @@ DỮ LIỆU THỰC TẾ (CHỈ ĐƯỢC ĐỀ CẬP ĐẾN CÁC THÔNG TIN NÀY)
 QUAN TRỌNG:
 - CHỈ được đề cập đến thông tin trong danh sách trên
 - KHÔNG được tự tạo tên nhà hàng, món ăn, dịch vụ, hoặc thông tin nào khác
-- Nếu user hỏi về thông tin không có trong danh sách → Nói "Không tìm thấy"
+- ✅ CÓ DỮ LIỆU TRONG DANH SÁCH → BẮT BUỘC phải đề cập đến ít nhất một số món/nhà hàng
+- KHÔNG được trả "Không tìm thấy" nếu đã có dữ liệu trong danh sách
+- Nếu user hỏi về thông tin không có trong danh sách → Nói "Trong danh sách hiện tại, tôi có thể gợi ý..." (KHÔNG nói "Không tìm thấy")
 - Format response tự nhiên và tổng hợp các loại thông tin một cách hợp lý"""
         
         messages = [
@@ -1200,8 +1940,23 @@ QUAN TRỌNG:
         
         response = await self._call_openai(messages)
         
+        # ✅ FIX: Log response để debug
+        logger.info(f"_format_multi_data_with_ai: LLM response length={len(response) if response else 0}")
+        if response:
+            logger.debug(f"_format_multi_data_with_ai: LLM response preview={response[:200]}...")
+        
         # Fallback nếu AI không hoạt động
         if not response:
+            logger.warning(f"_format_multi_data_with_ai: LLM returned None, using fallback formatter")
+            return self._format_multi_data_fallback(restaurants, menus, services)
+        
+        # ✅ FIX: Nếu LLM trả "Không tìm thấy" nhưng có data → dùng fallback thay vì tin LLM
+        if "không tìm thấy" in response.lower() and (restaurants or menus or services):
+            logger.warning(
+                f"_format_multi_data_with_ai: LLM returned 'Không tìm thấy' but have data "
+                f"(restaurants={len(restaurants)}, menus={len(menus)}, services={len(services)}), "
+                f"using fallback formatter"
+            )
             return self._format_multi_data_fallback(restaurants, menus, services)
         
         return response
@@ -1259,10 +2014,23 @@ QUAN TRỌNG:
             # Show tất cả menus (đã filter theo distance)
             menus_to_show = menus[:30] if len(menus) > 30 else menus
             for dish in menus_to_show:
-                dish_name = dish.get("name") or dish.get("dishName") or "N/A"
+                # ✅ FIX: Normalize menu item (extract metadata nếu có)
+                dish = self._normalize_menu_item(dish)
+                
+                dish_name = (
+                    dish.get("name") 
+                    or dish.get("dishName") 
+                    or dish.get("dish_name")
+                    or "N/A"
+                )
                 price = dish.get("price")
-                restaurant_name = dish.get("_restaurantName") or dish.get("restaurantName")
+                restaurant_name = (
+                    dish.get("_restaurantName")
+                    or dish.get("restaurantName")
+                    or dish.get("restaurant_name")
+                )
                 description = dish.get("description")
+                
                 line = f"• **{dish_name}**"
                 if restaurant_name:
                     line += f" (Nhà hàng: {restaurant_name})"
@@ -1270,7 +2038,7 @@ QUAN TRỌNG:
                     line += " - N/A"
                 else:
                     price_str = str(price)
-                    if "vnđ" not in price_str.lower():
+                    if "vnđ" not in price_str.lower() and "đ" not in price_str.lower() and price_str.strip():
                         price_str += " VNĐ"
                     line += f" - {price_str}"
                 if description:
@@ -1345,11 +2113,15 @@ QUAN TRỌNG:
             )
             
             if completion.choices:
-                return completion.choices[0].message.content.strip()
+                response = completion.choices[0].message.content.strip()
+                # ✅ FIX: Log response để debug
+                logger.info(f"_call_openai: Response length={len(response)}, preview={response[:150]}...")
+                return response
+            logger.warning("_call_openai: No choices in completion")
             return None
 
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.error(f"OpenAI API error: {e}", exc_info=True)
             return None
 
     def _store_conversation(self, conversation_id: str, user_message: str, response: str):
