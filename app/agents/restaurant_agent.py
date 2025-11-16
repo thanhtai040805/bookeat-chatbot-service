@@ -1139,23 +1139,26 @@ Your capabilities:
     ) -> Optional[str]:
         if not items:
             return None
-        highlights = []
+        lines = [f"{label}:"]
         for item in items[:max_items]:
             name = item.get("name") or "N/A"
             description = item.get("description")
             price = item.get("price")
-            snippet = name
+            bullet_parts = [f"  • {name}"]
+            if price not in (None, "", "N/A"):
+                price_str = str(price)
+                if "vnđ" not in price_str.lower() and "đ" not in price_str.lower():
+                    price_str += " VNĐ"
+                bullet_parts.append(f"- {price_str}")
             if description:
                 trimmed = description.strip()
                 if len(trimmed) > 60:
                     trimmed = trimmed[:60].rstrip() + "..."
-                snippet += f" ({trimmed})"
-            if price not in (None, "", "N/A"):
-                snippet += f" - {price}"
-            highlights.append(snippet)
+                bullet_parts.append(f"- {trimmed}")
+            lines.append(" ".join(bullet_parts))
         if len(items) > max_items:
-            highlights.append(f"... và {len(items) - max_items} {label.lower()} khác")
-        return f"{label}: " + "; ".join(highlights)
+            lines.append(f"  • ... và {len(items) - max_items} {label.lower()} khác")
+        return "\n".join(lines)
     
     async def _extract_restaurants_from_history(self, user_id: str) -> List[Dict]:
         """
@@ -1768,126 +1771,72 @@ Your capabilities:
         data_context_parts = []
         
         if restaurants:
-            # Không limit vì đã filter theo distance - chỉ giới hạn token (max 20 restaurants)
             restaurants_to_show = restaurants[:20] if len(restaurants) > 20 else restaurants
             restaurant_lines: List[str] = []
-            for index, r in enumerate(restaurants_to_show, 1):
-                # ✅ FIX: Normalize restaurant item trước khi format
-                r = self._normalize_restaurant_item(r)
-                
-                base_line = (
-                    f"{index}. NHÀ HÀNG - Tên: {r.get('restaurantName', r.get('name', 'N/A'))}, "
-                    f"Địa chỉ: {r.get('address', 'N/A')}, "
-                    f"Loại: {r.get('cuisineType', 'N/A')}, "
-                    f"Rating: {r.get('rating', 'N/A')}/5"
-                )
-                detail_lines = [base_line]
-
+            for index, r_raw in enumerate(restaurants_to_show, 1):
+                # Normalize trước
+                r = self._normalize_restaurant_item(r_raw)
+                name = r.get("restaurantName", r.get("name", "N/A"))
+                address = r.get("address", "N/A")
+                cuisine = r.get("cuisineType", "N/A")
+                rating = r.get("rating", "N/A")
+                header_line = f"{index}. **{name}**"
+                info_lines = []
+                # ⭐ Chỉ hiển thị khi rating hợp lệ
+                if rating not in (None, "", "N/A", "N/A/5"):
+                    info_lines.append(f"⭐ Rating: {rating}/5")
+                info_lines.append(f"📍 Địa chỉ: {address}")
+                info_lines.append(f"🍽️ Loại: {cuisine}")
                 menu_summary = self._render_match_summary(r.get("_matchedMenus", []), "Món phù hợp")
                 if menu_summary:
-                    detail_lines.append(f"   • {menu_summary}")
-
+                    info_lines.append(menu_summary)
                 service_summary = self._render_match_summary(r.get("_matchedServices", []), "Dịch vụ nổi bật")
                 if service_summary:
-                    detail_lines.append(f"   • {service_summary}")
-
+                    info_lines.append(service_summary)
                 table_summary = self._render_match_summary(r.get("_matchedTables", []), "Bố trí bàn", max_items=2)
                 if table_summary:
-                    detail_lines.append(f"   • {table_summary}")
-
-                restaurant_lines.append("\n".join(detail_lines))
-
+                    info_lines.append(table_summary)
+                restaurant_block = "\n".join([header_line] + info_lines)
+                restaurant_lines.append(restaurant_block)
             if len(restaurants) > 20:
                 restaurant_lines.append(f"... và {len(restaurants) - 20} nhà hàng khác.")
-
-            data_context_parts.append("DANH SÁCH NHÀ HÀNG:\n" + "\n".join(restaurant_lines))
+            data_context_parts.append("DANH SÁCH NHÀ HÀNG:\n" + "\n\n".join(restaurant_lines))
         
         if menus:
-            # Không limit vì đã filter theo distance - chỉ giới hạn token (max 30 dishes)
             menus_to_show = menus[:30] if len(menus) > 30 else menus
             menu_lines: List[str] = []
-            for dish in menus_to_show:
-                # ✅ FIX: Normalize menu item (extract metadata nếu có)
-                dish = self._normalize_menu_item(dish)
-                
-                # Extract dish info với nhiều fallback options
+            for dish_raw in menus_to_show:
+                dish = self._normalize_menu_item(dish_raw)
                 dish_name = (
-                    dish.get("name") 
-                    or dish.get("dishName") 
+                    dish.get("name")
+                    or dish.get("dishName")
                     or dish.get("dish_name")
                     or "N/A"
                 )
-                
                 price = dish.get("price")
                 description = dish.get("description")
-                
-                # Restaurant name từ enriched fields hoặc metadata
                 restaurant_name = (
-                    dish.get("_restaurantName")  # Enriched từ aggregation
+                    dish.get("_restaurantName")
                     or dish.get("restaurantName")
                     or dish.get("restaurant_name")
                 )
-                
-                # Category/type nếu có
-                category = dish.get("category") or dish.get("dishCategory")
-                
-                # Tags nếu có (để hiển thị semantic context)
-                tags = dish.get("tags", [])
-                if isinstance(tags, str):
-                    try:
-                        import ast
-                        tags = ast.literal_eval(tags) if tags.startswith("[") else [tags]
-                    except:
-                        tags = [tags] if tags else []
-                
-                line = f"- MÓN - {dish_name}"
-                
-                # Add restaurant context
+                block_lines = [f"• **{dish_name}**"]
                 if restaurant_name:
-                    line += f" (Nhà hàng: {restaurant_name})"
-                
-                # Add category nếu có
-                if category:
-                    line += f" [Loại: {category}]"
-                
-                # Add price
-                if price in (None, "", "N/A"):
-                    line += ": N/A"
-                else:
+                    block_lines.append(f"  🏠 Nhà hàng: {restaurant_name}")
+                if price not in (None, "", "N/A"):
                     price_str = str(price)
-                    if "vnđ" not in price_str.lower() and "đ" not in price_str.lower() and price_str.strip():
+                    if "vnđ" not in price_str.lower() and "đ" not in price_str.lower():
                         price_str += " VNĐ"
-                    line += f": {price_str}"
-                
-                # Add description
+                    block_lines.append(f"  💰 Giá: {price_str}")
                 if description:
                     trimmed_desc = description.strip()
                     if len(trimmed_desc) > 80:
                         trimmed_desc = trimmed_desc[:80].rstrip() + "..."
-                    line += f" - {trimmed_desc}"
-                
-                # Add tags context nếu có (semantic boost info)
-                if isinstance(tags, list) and tags:
-                    tag_labels = []
-                    tag_map = {
-                        "high_protein": "Giàu protein",
-                        "low_fat": "Ít béo",
-                        "light_meal": "Món nhẹ",
-                        "good_when_sick": "Tốt khi ốm",
-                        "vegetarian": "Chay",
-                        "spicy": "Cay"
-                    }
-                    for tag in tags[:3]:  # Chỉ hiển thị 3 tags đầu
-                        if tag in tag_map:
-                            tag_labels.append(tag_map[tag])
-                    if tag_labels:
-                        line += f" ({', '.join(tag_labels)})"
-                
-                menu_lines.append(line)
-            
+                    block_lines.append(f"  📝 {trimmed_desc}")
+                menu_lines.append("\n".join(block_lines))
             if len(menus) > 30:
                 menu_lines.append(f"... và {len(menus) - 30} món khác.")
-            data_context_parts.append("DANH SÁCH MÓN ĂN:\n" + "\n".join(menu_lines))
+            data_context_parts.append("DANH SÁCH MÓN ĂN:\n" + "\n\n".join(menu_lines))
         
         if services:
             # Không limit vì đã filter theo distance - chỉ giới hạn token (max 15 services)
@@ -1916,18 +1865,74 @@ Your capabilities:
             return "Không tìm thấy thông tin phù hợp."
         
         # STRICT System Prompt
+        has_data_prefix = "ĐÃ " if (restaurants or menus or services) else ""
         strict_prompt = f"""{self.strict_system_prompt}
 
 DỮ LIỆU THỰC TẾ (CHỈ ĐƯỢC ĐỀ CẬP ĐẾN CÁC THÔNG TIN NÀY):
 {data_context}
 
+HƯỚNG DẪN FORMAT RESPONSE:
+
+- Luôn trả lời bằng tiếng Việt (trừ khi user dùng tiếng Anh).
+
+- Mở đầu bằng 1–2 câu tóm tắt ngắn gọn bối cảnh của user 
+
+  (ví dụ: tập gym, bị cảm, bị sẹo, huyết áp cao...) dựa trên nội dung câu hỏi.
+
+- BẮT BUỘC: Mỗi món ăn/nhà hàng phải được format trên NHIỀU DÒNG, KHÔNG được gộp vào 1 dòng.
+
+- Format MÓN ĂN theo mẫu sau (MỖI THÔNG TIN MỘT DÒNG):
+
+  • **Tên món**
+    🏠 Nhà hàng: Tên nhà hàng
+    💰 Giá: X VNĐ
+    📝 Mô tả ngắn gọn
+
+  Ví dụ cụ thể:
+  • **Canh chua cá lóc**
+    🏠 Nhà hàng: Hải Sản Bà Cường
+    💰 Giá: 50.000 VNĐ
+    📝 Canh chua ngọt với cá lóc tươi, rau thơm
+
+- Format NHÀ HÀNG theo mẫu sau (MỖI THÔNG TIN MỘT DÒNG):
+
+  **Tên nhà hàng**
+  📍 Địa chỉ: ...
+  🍽️ Loại: ...
+  ⭐ Rating: ... (chỉ nếu có)
+
+- SỬ DỤNG XUỐNG DÒNG (\\n) giữa mỗi thông tin. KHÔNG BAO GIỜ gộp tất cả vào 1 dòng dài.
+
+- Sử dụng markdown: **bold**, emoji (🍽️ 📍 ⭐ 💰 🏠 🩹 💪 🤒) để giúp dễ đọc.
+
 QUAN TRỌNG:
-- CHỈ được đề cập đến thông tin trong danh sách trên
-- KHÔNG được tự tạo tên nhà hàng, món ăn, dịch vụ, hoặc thông tin nào khác
-- ✅ CÓ DỮ LIỆU TRONG DANH SÁCH → BẮT BUỘC phải đề cập đến ít nhất một số món/nhà hàng
-- KHÔNG được trả "Không tìm thấy" nếu đã có dữ liệu trong danh sách
-- Nếu user hỏi về thông tin không có trong danh sách → Nói "Trong danh sách hiện tại, tôi có thể gợi ý..." (KHÔNG nói "Không tìm thấy")
-- Format response tự nhiên và tổng hợp các loại thông tin một cách hợp lý"""
+
+- CHỈ được đề cập đến thông tin trong danh sách trên.
+
+- KHÔNG được tự tạo tên nhà hàng, món ăn, dịch vụ, hoặc thông tin nào khác.
+
+- ✅ KHI ĐÃ CÓ DỮ LIỆU trong danh sách → BẮT BUỘC phải gợi ý ít nhất một số món/nhà hàng phù hợp với câu hỏi.
+
+- KHÔNG được trả "Không tìm thấy" nếu {has_data_prefix}có dữ liệu trong danh sách.
+
+- Nếu user hỏi về thông tin không có trong danh sách → trả lời theo dạng:
+
+  "Trong danh sách hiện tại, tôi có thể gợi ý cho bạn những lựa chọn sau..." 
+
+  và dùng các item có sẵn trong dữ liệu.
+
+- Format response tự nhiên, dễ đọc, có xuống dòng hợp lý.
+
+LƯU Ý CUỐI CÙNG - RẤT QUAN TRỌNG:
+- MỖI món ăn phải có TÊN MÓN trên 1 dòng, NHÀ HÀNG trên 1 dòng, GIÁ trên 1 dòng, MÔ TẢ trên 1 dòng.
+- KHÔNG BAO GIỜ viết kiểu: "• **Tên món** 🏠 Nhà hàng: ... 💰 Giá: ... 📝 ..." trên cùng 1 dòng.
+- PHẢI viết:
+  • **Tên món**
+    🏠 Nhà hàng: ...
+    💰 Giá: ...
+    📝 Mô tả
+
+"""
         
         messages = [
             {"role": "system", "content": strict_prompt},
